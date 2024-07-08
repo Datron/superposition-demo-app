@@ -177,7 +177,7 @@ async fn main() -> std::io::Result<()> {
             .service(home)
             .service(fs::Files::new("/static", "./web/").show_files_listing().index_file("index.html"))
     })
-    .bind(("127.0.0.1", 9090))?
+    .bind(("0.0.0.0", 9090))?
     .run()
     .await
 }
