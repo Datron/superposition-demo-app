@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 12.18
--- Dumped by pg_dump version 12.18
+-- Dumped from database version 12.19
+-- Dumped by pg_dump version 12.19
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -103,6 +103,44 @@ CREATE DOMAIN dev_experimentation.not_null_text AS text NOT NULL;
 
 
 ALTER DOMAIN dev_experimentation.not_null_text OWNER TO postgres;
+
+--
+-- Name: dimension_type; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.dimension_type AS ENUM (
+    'NULL',
+    'BOOL',
+    'NUMBER',
+    'STRING',
+    'ARRAY',
+    'OBJECT'
+);
+
+
+ALTER TYPE public.dimension_type OWNER TO postgres;
+
+--
+-- Name: experiment_status_type; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.experiment_status_type AS ENUM (
+    'CREATED',
+    'CONCLUDED',
+    'INPROGRESS'
+);
+
+
+ALTER TYPE public.experiment_status_type OWNER TO postgres;
+
+--
+-- Name: not_null_text; Type: DOMAIN; Schema: public; Owner: postgres
+--
+
+CREATE DOMAIN public.not_null_text AS text NOT NULL;
+
+
+ALTER DOMAIN public.not_null_text OWNER TO postgres;
 
 --
 -- Name: dimension_type; Type: TYPE; Schema: test_cac; Owner: postgres
@@ -251,6 +289,97 @@ $$;
 ALTER FUNCTION dev_experimentation.event_logger() OWNER TO postgres;
 
 --
+-- Name: diesel_manage_updated_at(regclass); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.diesel_manage_updated_at(_tbl regclass) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    EXECUTE format('CREATE TRIGGER set_updated_at BEFORE UPDATE ON %s
+                    FOR EACH ROW EXECUTE PROCEDURE diesel_set_updated_at()', _tbl);
+END;
+$$;
+
+
+ALTER FUNCTION public.diesel_manage_updated_at(_tbl regclass) OWNER TO postgres;
+
+--
+-- Name: diesel_set_updated_at(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.diesel_set_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF (
+        NEW IS DISTINCT FROM OLD AND
+        NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at
+    ) THEN
+        NEW.updated_at := current_timestamp;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.diesel_set_updated_at() OWNER TO postgres;
+
+--
+-- Name: event_logger(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.event_logger() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    old_data json;
+    new_data json;
+BEGIN
+    IF (TG_OP = 'UPDATE') THEN
+        old_data := row_to_json(OLD);
+        new_data := row_to_json(NEW);
+        INSERT INTO public.event_log
+            (table_name, user_name, action, original_data, new_data, query)
+            VALUES (
+                TG_TABLE_NAME::TEXT,
+                session_user::TEXT,
+                TG_OP,
+                old_data,
+                new_data,
+                current_query()
+            );
+    ELSIF (TG_OP = 'DELETE') THEN
+        old_data := row_to_json(OLD);
+        INSERT INTO public.event_log
+            (table_name, user_name, action, original_data, query)
+            VALUES (
+                TG_TABLE_NAME::TEXT,
+                session_user::TEXT,
+                TG_OP,
+                old_data,
+                current_query()
+            );
+    ELSIF (TG_OP = 'INSERT') THEN
+        new_data = row_to_json(NEW);
+        INSERT INTO public.event_log
+            (table_name, user_name, action, new_data, query)
+            VALUES (
+                TG_TABLE_NAME::TEXT,
+                session_user::TEXT,
+                TG_OP,
+                new_data,
+                current_query()
+            );
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION public.event_logger() OWNER TO postgres;
+
+--
 -- Name: event_logger(); Type: FUNCTION; Schema: test_cac; Owner: postgres
 --
 
@@ -363,6 +492,22 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
+-- Name: config_versions; Type: TABLE; Schema: dev_cac; Owner: postgres
+--
+
+CREATE TABLE dev_cac.config_versions (
+    id bigint NOT NULL,
+    config json NOT NULL,
+    config_hash text NOT NULL,
+    tags character varying(100)[],
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT config_versions_tags_check CHECK ((array_position(tags, NULL::character varying) IS NULL))
+);
+
+
+ALTER TABLE dev_cac.config_versions OWNER TO postgres;
+
+--
 -- Name: contexts; Type: TABLE; Schema: dev_cac; Owner: postgres
 --
 
@@ -373,7 +518,9 @@ CREATE TABLE dev_cac.contexts (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     created_by character varying NOT NULL,
     priority integer DEFAULT 1 NOT NULL,
-    override json DEFAULT '{}'::json NOT NULL
+    override json DEFAULT '{}'::json NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
@@ -389,7 +536,9 @@ CREATE TABLE dev_cac.default_configs (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     created_by character varying NOT NULL,
     schema json DEFAULT '{}'::json NOT NULL,
-    function_name text
+    function_name text,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
@@ -405,7 +554,9 @@ CREATE TABLE dev_cac.dimensions (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     created_by character varying NOT NULL,
     schema json DEFAULT '{}'::json NOT NULL,
-    function_name text
+    function_name text,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
@@ -1223,11 +1374,29 @@ CREATE TABLE dev_cac.functions (
     published_at timestamp without time zone,
     draft_edited_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     published_by text,
-    draft_edited_by text NOT NULL
+    draft_edited_by text NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
 ALTER TABLE dev_cac.functions OWNER TO postgres;
+
+--
+-- Name: type_templates; Type: TABLE; Schema: dev_cac; Owner: postgres
+--
+
+CREATE TABLE dev_cac.type_templates (
+    type_name text NOT NULL,
+    type_schema json NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
+);
+
+
+ALTER TABLE dev_cac.type_templates OWNER TO postgres;
 
 --
 -- Name: event_log; Type: TABLE; Schema: dev_experimentation; Owner: postgres
@@ -2051,6 +2220,964 @@ CREATE TABLE dev_experimentation.experiments (
 ALTER TABLE dev_experimentation.experiments OWNER TO postgres;
 
 --
+-- Name: __diesel_schema_migrations; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.__diesel_schema_migrations (
+    version character varying(50) NOT NULL,
+    run_on timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+ALTER TABLE public.__diesel_schema_migrations OWNER TO postgres;
+
+--
+-- Name: config_versions; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.config_versions (
+    id bigint NOT NULL,
+    config json NOT NULL,
+    config_hash text NOT NULL,
+    tags character varying(100)[],
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT config_versions_tags_check CHECK ((array_position(tags, NULL::character varying) IS NULL))
+);
+
+
+ALTER TABLE public.config_versions OWNER TO postgres;
+
+--
+-- Name: contexts; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.contexts (
+    id character varying NOT NULL,
+    value json NOT NULL,
+    override_id character varying NOT NULL,
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    created_by character varying NOT NULL,
+    priority integer DEFAULT 1 NOT NULL,
+    override json DEFAULT '{}'::json NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
+);
+
+
+ALTER TABLE public.contexts OWNER TO postgres;
+
+--
+-- Name: default_configs; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.default_configs (
+    key character varying NOT NULL,
+    value json NOT NULL,
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    created_by character varying NOT NULL,
+    schema json DEFAULT '{}'::json NOT NULL,
+    function_name text,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
+);
+
+
+ALTER TABLE public.default_configs OWNER TO postgres;
+
+--
+-- Name: dimensions; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.dimensions (
+    dimension character varying NOT NULL,
+    priority integer NOT NULL,
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    created_by character varying NOT NULL,
+    schema json DEFAULT '{}'::json NOT NULL,
+    function_name text,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
+);
+
+
+ALTER TABLE public.dimensions OWNER TO postgres;
+
+--
+-- Name: event_log; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+)
+PARTITION BY RANGE ("timestamp");
+
+
+ALTER TABLE public.event_log OWNER TO postgres;
+
+--
+-- Name: event_log_y2023m08; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2023m08 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2023m08 FOR VALUES FROM ('2023-08-01 00:00:00') TO ('2023-09-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2023m08 OWNER TO postgres;
+
+--
+-- Name: event_log_y2023m09; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2023m09 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2023m09 FOR VALUES FROM ('2023-09-01 00:00:00') TO ('2023-10-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2023m09 OWNER TO postgres;
+
+--
+-- Name: event_log_y2023m10; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2023m10 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2023m10 FOR VALUES FROM ('2023-10-01 00:00:00') TO ('2023-11-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2023m10 OWNER TO postgres;
+
+--
+-- Name: event_log_y2023m11; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2023m11 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2023m11 FOR VALUES FROM ('2023-11-01 00:00:00') TO ('2023-12-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2023m11 OWNER TO postgres;
+
+--
+-- Name: event_log_y2023m12; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2023m12 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2023m12 FOR VALUES FROM ('2023-12-01 00:00:00') TO ('2024-01-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2023m12 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m01; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m01 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m01 FOR VALUES FROM ('2024-01-01 00:00:00') TO ('2024-02-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m01 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m02; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m02 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m02 FOR VALUES FROM ('2024-02-01 00:00:00') TO ('2024-03-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m02 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m03; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m03 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m03 FOR VALUES FROM ('2024-03-01 00:00:00') TO ('2024-04-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m03 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m04; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m04 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m04 FOR VALUES FROM ('2024-04-01 00:00:00') TO ('2024-05-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m04 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m05; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m05 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m05 FOR VALUES FROM ('2024-05-01 00:00:00') TO ('2024-06-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m05 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m06; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m06 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m06 FOR VALUES FROM ('2024-06-01 00:00:00') TO ('2024-07-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m06 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m07; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m07 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m07 FOR VALUES FROM ('2024-07-01 00:00:00') TO ('2024-08-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m07 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m08; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m08 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m08 FOR VALUES FROM ('2024-08-01 00:00:00') TO ('2024-09-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m08 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m09; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m09 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m09 FOR VALUES FROM ('2024-09-01 00:00:00') TO ('2024-10-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m09 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m10; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m10 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m10 FOR VALUES FROM ('2024-10-01 00:00:00') TO ('2024-11-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m10 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m11; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m11 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m11 FOR VALUES FROM ('2024-11-01 00:00:00') TO ('2024-12-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m11 OWNER TO postgres;
+
+--
+-- Name: event_log_y2024m12; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2024m12 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2024m12 FOR VALUES FROM ('2024-12-01 00:00:00') TO ('2025-01-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2024m12 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m01; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m01 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m01 FOR VALUES FROM ('2025-01-01 00:00:00') TO ('2025-02-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m01 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m02; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m02 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m02 FOR VALUES FROM ('2025-02-01 00:00:00') TO ('2025-03-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m02 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m03; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m03 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m03 FOR VALUES FROM ('2025-03-01 00:00:00') TO ('2025-04-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m03 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m04; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m04 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m04 FOR VALUES FROM ('2025-04-01 00:00:00') TO ('2025-05-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m04 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m05; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m05 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m05 FOR VALUES FROM ('2025-05-01 00:00:00') TO ('2025-06-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m05 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m06; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m06 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m06 FOR VALUES FROM ('2025-06-01 00:00:00') TO ('2025-07-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m06 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m07; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m07 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m07 FOR VALUES FROM ('2025-07-01 00:00:00') TO ('2025-08-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m07 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m08; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m08 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m08 FOR VALUES FROM ('2025-08-01 00:00:00') TO ('2025-09-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m08 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m09; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m09 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m09 FOR VALUES FROM ('2025-09-01 00:00:00') TO ('2025-10-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m09 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m10; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m10 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m10 FOR VALUES FROM ('2025-10-01 00:00:00') TO ('2025-11-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m10 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m11; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m11 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m11 FOR VALUES FROM ('2025-11-01 00:00:00') TO ('2025-12-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m11 OWNER TO postgres;
+
+--
+-- Name: event_log_y2025m12; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2025m12 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2025m12 FOR VALUES FROM ('2025-12-01 00:00:00') TO ('2026-01-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2025m12 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m01; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m01 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m01 FOR VALUES FROM ('2026-01-01 00:00:00') TO ('2026-02-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m01 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m02; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m02 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m02 FOR VALUES FROM ('2026-02-01 00:00:00') TO ('2026-03-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m02 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m03; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m03 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m03 FOR VALUES FROM ('2026-03-01 00:00:00') TO ('2026-04-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m03 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m04; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m04 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m04 FOR VALUES FROM ('2026-04-01 00:00:00') TO ('2026-05-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m04 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m05; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m05 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m05 FOR VALUES FROM ('2026-05-01 00:00:00') TO ('2026-06-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m05 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m06; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m06 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m06 FOR VALUES FROM ('2026-06-01 00:00:00') TO ('2026-07-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m06 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m07; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m07 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m07 FOR VALUES FROM ('2026-07-01 00:00:00') TO ('2026-08-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m07 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m08; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m08 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m08 FOR VALUES FROM ('2026-08-01 00:00:00') TO ('2026-09-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m08 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m09; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m09 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m09 FOR VALUES FROM ('2026-09-01 00:00:00') TO ('2026-10-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m09 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m10; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m10 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m10 FOR VALUES FROM ('2026-10-01 00:00:00') TO ('2026-11-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m10 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m11; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m11 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m11 FOR VALUES FROM ('2026-11-01 00:00:00') TO ('2026-12-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m11 OWNER TO postgres;
+
+--
+-- Name: event_log_y2026m12; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.event_log_y2026m12 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    table_name text NOT NULL,
+    user_name text NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    action text NOT NULL,
+    original_data json,
+    new_data json,
+    query text NOT NULL
+);
+ALTER TABLE ONLY public.event_log ATTACH PARTITION public.event_log_y2026m12 FOR VALUES FROM ('2026-12-01 00:00:00') TO ('2027-01-01 00:00:00');
+
+
+ALTER TABLE public.event_log_y2026m12 OWNER TO postgres;
+
+--
+-- Name: experiments; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.experiments (
+    id bigint NOT NULL,
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    created_by text NOT NULL,
+    last_modified timestamp with time zone DEFAULT now() NOT NULL,
+    name text NOT NULL,
+    override_keys public.not_null_text[] NOT NULL,
+    status public.experiment_status_type NOT NULL,
+    traffic_percentage integer NOT NULL,
+    context json NOT NULL,
+    variants json NOT NULL,
+    last_modified_by text DEFAULT 'Null'::text NOT NULL,
+    chosen_variant text,
+    CONSTRAINT experiments_traffic_percentage_check CHECK ((traffic_percentage >= 0))
+);
+
+
+ALTER TABLE public.experiments OWNER TO postgres;
+
+--
+-- Name: functions; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.functions (
+    function_name text NOT NULL,
+    published_code text,
+    draft_code text NOT NULL,
+    function_description text NOT NULL,
+    published_runtime_version character varying(16),
+    draft_runtime_version character varying(16) NOT NULL,
+    published_at timestamp without time zone,
+    draft_edited_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    published_by text,
+    draft_edited_by text NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
+);
+
+
+ALTER TABLE public.functions OWNER TO postgres;
+
+--
+-- Name: type_templates; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.type_templates (
+    type_name text NOT NULL,
+    type_schema json NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
+);
+
+
+ALTER TABLE public.type_templates OWNER TO postgres;
+
+--
+-- Name: config_versions; Type: TABLE; Schema: test_cac; Owner: postgres
+--
+
+CREATE TABLE test_cac.config_versions (
+    id bigint NOT NULL,
+    config json NOT NULL,
+    config_hash text NOT NULL,
+    tags character varying(100)[],
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT config_versions_tags_check CHECK ((array_position(tags, NULL::character varying) IS NULL))
+);
+
+
+ALTER TABLE test_cac.config_versions OWNER TO postgres;
+
+--
 -- Name: contexts; Type: TABLE; Schema: test_cac; Owner: postgres
 --
 
@@ -2061,7 +3188,9 @@ CREATE TABLE test_cac.contexts (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     created_by character varying NOT NULL,
     priority integer DEFAULT 1 NOT NULL,
-    override json DEFAULT '{}'::json NOT NULL
+    override json DEFAULT '{}'::json NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
@@ -2077,7 +3206,9 @@ CREATE TABLE test_cac.default_configs (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     created_by character varying NOT NULL,
     schema json DEFAULT '{}'::json NOT NULL,
-    function_name text
+    function_name text,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
@@ -2093,7 +3224,9 @@ CREATE TABLE test_cac.dimensions (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     created_by character varying NOT NULL,
     schema json DEFAULT '{}'::json NOT NULL,
-    function_name text
+    function_name text,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
@@ -2911,11 +4044,29 @@ CREATE TABLE test_cac.functions (
     published_at timestamp without time zone,
     draft_edited_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     published_by text,
-    draft_edited_by text NOT NULL
+    draft_edited_by text NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
 );
 
 
 ALTER TABLE test_cac.functions OWNER TO postgres;
+
+--
+-- Name: type_templates; Type: TABLE; Schema: test_cac; Owner: postgres
+--
+
+CREATE TABLE test_cac.type_templates (
+    type_name text NOT NULL,
+    type_schema json NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_modified_by character varying(200) DEFAULT 'null'::character varying NOT NULL
+);
+
+
+ALTER TABLE test_cac.type_templates OWNER TO postgres;
 
 --
 -- Name: event_log; Type: TABLE; Schema: test_experimentation; Owner: postgres
@@ -3739,15 +4890,36 @@ CREATE TABLE test_experimentation.experiments (
 ALTER TABLE test_experimentation.experiments OWNER TO postgres;
 
 --
+-- Data for Name: config_versions; Type: TABLE DATA; Schema: dev_cac; Owner: postgres
+--
+
+COPY dev_cac.config_versions (id, config, config_hash, tags, created_at) FROM stdin;
+7232358713959518208	{"contexts":[],"default_configs":{"base_rate":10.0},"overrides":{}}	a3a50ef5b9a9367bdd48fa4003b5f07686bcf67833085403c5fff5f93b82eba1	\N	2024-08-22 12:11:28.140378
+7232358930557571072	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR"},"overrides":{}}	dc10e297ed72652a199e8ca90d460baa61889f171d8e8d9d738d336dafa312f8	\N	2024-08-22 12:12:19.784469
+7232359004368932864	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","per_distance_unit_rate":15.0},"overrides":{}}	ac9e3d933a912bb368f807dce0f9b2eda1d0d04de45e2f65eaada0b7f73f3618	\N	2024-08-22 12:12:37.376048
+7232359073344262144	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","per_distance_unit_rate":15.0},"overrides":{}}	53f07c85de4c1f0ca36dea05f777b371e5bd781c4f8f91f5413a73537a0f74e9	\N	2024-08-22 12:12:53.82093
+7232359201773850624	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.foo":1,"per_distance_unit_rate":15.0},"overrides":{}}	b3eccaacd7e0e41e1dd1b5c98e3e13bc355e157da9c3ba0c2b5df6b2274d8413	\N	2024-08-22 12:13:24.441938
+7232359257818140672	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"per_distance_unit_rate":15.0},"overrides":{}}	5e78b646a4cf075a1077bb29428d89f5c2766a82574c667344f562bee6f7d35e	\N	2024-08-22 12:13:37.802393
+7232359361463586816	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","per_distance_unit_rate":15.0},"overrides":{}}	93b148788b8cdf5a53ff0838a2e4cc57e4639506d72cd3145012773bcc3160f6	\N	2024-08-22 12:14:02.515588
+7232359465125810176	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","hello_message_color":"black","per_distance_unit_rate":15.0},"overrides":{}}	c2868ac9f66cd4ff612abb0dcb9179fc21474935c1c7ee0782d52a344750c083	\N	2024-08-22 12:14:27.229587
+7232359642309988352	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{}}	ba7a77fa7075d31a5570b619819e1d7e8ba1501b37ca09c75219961383a66c4d	\N	2024-08-22 12:15:09.473512
+7232360003494088704	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["be6a0ddbb08dae3007756cdc2be0676b94328b339f23cdfed5401b501c2c92fa"],"priority":4}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"be6a0ddbb08dae3007756cdc2be0676b94328b339f23cdfed5401b501c2c92fa":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"\\thttps://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}}}	cd1fb4ac34f5aebb0d5d868b6e0ed9344b8778606dc3295fa9e9e62b95d582cd	\N	2024-08-22 12:16:35.58566
+7232360038369726464	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a"],"priority":4}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}}}	5caf05c91b6a65c061786dfb0c864a57a1e93d764c4411a9f3977fc9a72192c7	\N	2024-08-22 12:16:43.900492
+7232364985974919168	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a"],"priority":4},{"condition":{"==":[{"var":"city"},"Chennai"]},"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","override_with_keys":["645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b"],"priority":4}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"}}}	7cf9194bcaa8a633264af875b43b1a44c36e67210c2c48652400db633da85be0	\N	2024-08-22 12:36:23.503558
+7232365274614337536	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a"],"priority":4},{"condition":{"==":[{"var":"city"},"Chennai"]},"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","override_with_keys":["645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b"],"priority":4},{"condition":{"==":[{"var":"city"},"Seattle"]},"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","override_with_keys":["f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69"],"priority":4}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}}}	73c39f8ed9b6a7d7bda339f9f393576e83fef4a45600c135b1fddddb6bfcecc6	\N	2024-08-22 12:37:32.321073
+7232365362266902528	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a"],"priority":4},{"condition":{"==":[{"var":"city"},"Chennai"]},"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","override_with_keys":["645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b"],"priority":4},{"condition":{"==":[{"var":"city"},"Seattle"]},"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","override_with_keys":["f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69"],"priority":4},{"condition":{"and":[{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"vehicle_type"},"cab"]}]},"id":"9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc","override_with_keys":["e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede"],"priority":6}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","foo.bar":2,"foo.foo":1,"hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede":{"base_rate":12},"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}}}	f31a2b17519f38b5d859faf645da70e323566c3bca437a496453da0aa6f9e4bb	\N	2024-08-22 12:37:53.219121
+\.
+
+
+--
 -- Data for Name: contexts; Type: TABLE DATA; Schema: dev_cac; Owner: postgres
 --
 
-COPY dev_cac.contexts (id, value, override_id, created_at, created_by, priority, override) FROM stdin;
-9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc	{"and":[{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"vehicle_type"},"cab"]}]}	e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede	2024-05-07 17:51:39.330747+00	superposition@juspay.in	6	{"base_rate":12}
-d8256cd0c9fbbfae460057ed14f0630f4dd0b050cf271832b0c9bfb5e31ca43b	{"and":[{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"hour_of_day"},9]}]}	204dc317acb302d38289cbfbc3227461d45bdde8dc5bfc0f6f961a8bb476e910	2024-05-08 08:02:50.144267+00	superposition@juspay.in	38	{"base_rate":100,"per_distance_unit_rate":50}
-11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4	{"==":[{"var":"city"},"Bangalore"]}	932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153	2024-05-10 14:45:07.769368+00	user@superposition.io	4	{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}
-e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8	{"==":[{"var":"city"},"Chennai"]}	645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b	2024-05-10 14:48:42.122682+00	user@superposition.io	4	{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"}
-3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35	{"==":[{"var":"city"},"Seattle"]}	f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69	2024-05-10 14:50:19.471563+00	user@superposition.io	4	{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}
+COPY dev_cac.contexts (id, value, override_id, created_at, created_by, priority, override, last_modified_at, last_modified_by) FROM stdin;
+11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4	{"==":[{"var":"city"},"Bangalore"]}	2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a	2024-08-22 12:16:35.579131+00	user@superposition.io	4	{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}	2024-08-22 12:16:43.897928	user@superposition.io
+e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8	{"==":[{"var":"city"},"Chennai"]}	645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b	2024-08-22 12:36:23.489214+00	user@superposition.io	4	{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"}	2024-08-22 12:36:23.489216	user@superposition.io
+3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35	{"==":[{"var":"city"},"Seattle"]}	f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69	2024-08-22 12:37:32.306949+00	user@superposition.io	4	{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}	2024-08-22 12:37:32.306953	user@superposition.io
+9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc	{"and":[{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"vehicle_type"},"cab"]}]}	e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede	2024-08-22 12:37:53.206065+00	user@superposition.io	6	{"base_rate":12}	2024-08-22 12:37:53.206068	user@superposition.io
 \.
 
 
@@ -3755,16 +4927,16 @@ e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8	{"==":[{"var":"
 -- Data for Name: default_configs; Type: TABLE DATA; Schema: dev_cac; Owner: postgres
 --
 
-COPY dev_cac.default_configs (key, value, created_at, created_by, schema, function_name) FROM stdin;
-base_rate	10.0	2024-05-05 10:53:22.654911+00	superposition@juspay.in	{"type":"number"}	\N
-currency	"INR"	2024-05-05 10:54:07.595371+00	superposition@juspay.in	{"enum":["INR","USD","EUR"],"type":"string"}	\N
-per_distance_unit_rate	15.0	2024-05-05 10:53:38.957119+00	superposition@juspay.in	{"type":"number"}	\N
-distance_unit	"Km"	2024-05-06 07:01:59.163885+00	superposition@juspay.in	{"enum":["Km","Miles"],"type":"string"}	\N
-bar.com	10	2024-05-07 15:02:11.504644+00	superposition@juspay.in	{"type":"number"}	\N
-bar.foo	10.0	2024-05-07 15:02:31.131308+00	superposition@juspay.in	{"type":"number"}	\N
-hello_message	"Hello World !!!"	2024-05-08 09:13:14.009736+00	superposition@juspay.in	{"pattern":".*","type":"string"}	\N
-hello_message_color	"black"	2024-05-08 10:25:50.551915+00	superposition@juspay.in	{"enum":["black","red","blue","green","pink"],"type":"string"}	\N
-logo	"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg"	2024-05-10 14:44:29.391516+00	user@superposition.io	{"pattern":"https://.*","type":"string"}	\N
+COPY dev_cac.default_configs (key, value, created_at, created_by, schema, function_name, last_modified_at, last_modified_by) FROM stdin;
+base_rate	10.0	2024-08-22 12:11:28.122453+00	user@superposition.io	{"type":"number"}	\N	2024-08-22 12:11:28.122802	user@superposition.io
+currency	"INR"	2024-08-22 12:12:19.765579+00	user@superposition.io	{"enum":["INR","USD","EUR"],"type":"string"}	\N	2024-08-22 12:12:19.765591	user@superposition.io
+per_distance_unit_rate	15.0	2024-08-22 12:12:37.370436+00	user@superposition.io	{"type":"number"}	\N	2024-08-22 12:12:37.370446	user@superposition.io
+distance_unit	"Km"	2024-08-22 12:12:53.814292+00	user@superposition.io	{"enum":["Km","Miles"],"type":"string"}	\N	2024-08-22 12:12:53.814303	user@superposition.io
+foo.foo	1	2024-08-22 12:13:24.43122+00	user@superposition.io	{"type":"integer"}	\N	2024-08-22 12:13:24.431231	user@superposition.io
+foo.bar	2	2024-08-22 12:13:37.788173+00	user@superposition.io	{"type":"number"}	\N	2024-08-22 12:13:37.788184	user@superposition.io
+hello_message	"Hello World !!!"	2024-08-22 12:14:02.505322+00	user@superposition.io	{"pattern":".*","type":"string"}	\N	2024-08-22 12:14:02.505334	user@superposition.io
+hello_message_color	"black"	2024-08-22 12:14:27.222544+00	user@superposition.io	{"enum":["black","red","blue","green","pink"],"type":"string"}	\N	2024-08-22 12:14:27.222551	user@superposition.io
+logo	"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg"	2024-08-22 12:15:08.701643+00	user@superposition.io	{"pattern":"https://.*","type":"string"}	axios_validator_example	2024-08-22 12:15:08.701648	user@superposition.io
 \.
 
 
@@ -3772,11 +4944,11 @@ logo	"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-204803
 -- Data for Name: dimensions; Type: TABLE DATA; Schema: dev_cac; Owner: postgres
 --
 
-COPY dev_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name) FROM stdin;
-variantIds	1	2024-05-01 11:25:39.025892+00	anon@juspay.in	{"type": "string","pattern": ".*"}	\N
-vehicle_type	2	2024-05-07 17:44:05.136115+00	superposition@juspay.in	{"enum":["cab","auto"],"type":"string"}	\N
-city	4	2024-05-07 17:44:16.716277+00	superposition@juspay.in	{"pattern":"[a-zA-Z ]+","type":"string"}	\N
-hour_of_day	32	2024-05-08 08:01:36.617931+00	superposition@juspay.in	{"type":"number"}	\N
+COPY dev_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name, last_modified_at, last_modified_by) FROM stdin;
+variantIds	1	2024-08-22 12:05:35.298665+00	user@example.com	{"type": "string","pattern": ".*"}	\N	2024-08-22 12:05:35.298665	null
+vehicle_type	2	2024-08-22 12:08:29.152994+00	user@superposition.io	{"enum":["cab","auto"],"type":"string"}	\N	2024-08-22 12:08:29.153249	user@superposition.io
+city	4	2024-08-22 12:08:56.435259+00	user@superposition.io	{"pattern":"[a-zA-Z ]+","type":"string"}	\N	2024-08-22 12:08:56.435264	user@superposition.io
+hour_of_day	32	2024-08-22 12:09:12.112655+00	user@superposition.io	{"type":"number"}	\N	2024-08-22 12:09:12.112665	user@superposition.io
 \.
 
 
@@ -3857,88 +5029,6 @@ COPY dev_cac.event_log_y2024m04 (id, table_name, user_name, "timestamp", action,
 --
 
 COPY dev_cac.event_log_y2024m05 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
-afb2d44c-cce3-4757-b3c9-10e37347bf79	dimensions	postgres	2024-05-01 11:25:39.025892	INSERT	\N	{"dimension":"variantIds","priority":1,"created_at":"2024-05-01T11:25:39.025892+00:00","created_by":"anon@juspay.in","schema":{"type": "string","pattern": ".*"},"function_name":null}	INSERT INTO dev_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name) VALUES ('variantIds', 1, CURRENT_TIMESTAMP, 'anon@juspay.in', '{"type": "string","pattern": ".*"}'::json, null);
-f32e1804-dcec-4643-b039-ea69afcd4e85	default_configs	postgres	2024-05-01 12:16:09.940256	INSERT	\N	{"key":"foo","value":10,"created_at":"2024-05-01T12:16:09.93811+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-ffd9d778-8b8d-47be-8c04-86fa95bae0e4	dimensions	postgres	2024-05-01 12:16:59.244634	INSERT	\N	{"dimension":"city","priority":1,"created_at":"2024-05-01T12:16:59.242405+00:00","created_by":"superposition@juspay.in","schema":{"pattern":"[a-zA-Z]+","type":"string"},"function_name":null}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name"
-1a65d9bc-bd07-4bd9-acb1-5f17272860ac	contexts	postgres	2024-05-01 12:17:16.16277	INSERT	\N	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"7faf7ac21a000f465344c4c4b403fa62cd9f9a0caecd684fe566f06260677503","created_at":"2024-05-01T12:17:16.160015+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":12}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-64be2b08-5844-491d-ab47-241244a2cfa1	contexts	postgres	2024-05-01 12:59:26.485692	INSERT	\N	{"id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","value":{"and":[{"in":["7191420957775499264-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-01T12:59:26.49421+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":10}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-9892302c-87bd-4e67-baba-a098c0062a53	contexts	postgres	2024-05-01 12:59:26.485692	INSERT	\N	{"id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","value":{"and":[{"in":["7191420957775499264-experimental",{"var":"variantIds"}]}]},"override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","created_at":"2024-05-01T12:59:26.521789+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":14}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-90085d39-b9a6-4d0a-b083-b1cbec778151	contexts	postgres	2024-05-02 04:13:27.450921	INSERT	\N	{"id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191650977466945536-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-02T04:13:27.464399+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":10}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-03ca94ac-fed9-4ffa-8c9e-585a580b5d8a	contexts	postgres	2024-05-02 04:13:27.450921	INSERT	\N	{"id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191650977466945536-experimental",{"var":"variantIds"}]}]},"override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","created_at":"2024-05-02T04:13:27.485522+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":17}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-49061f20-f09b-4145-8362-5bc71ee9132d	contexts	postgres	2024-05-02 04:13:53.806162	DELETE	{"id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191650977466945536-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-02T04:13:27.464399+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":10}}	\N	DELETE  FROM "contexts" WHERE ("contexts"."id" = $1)
-363597f0-0242-4f41-acec-a4dc9f66f81b	contexts	postgres	2024-05-02 04:13:53.806162	UPDATE	{"id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191650977466945536-experimental",{"var":"variantIds"}]}]},"override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","created_at":"2024-05-02T04:13:27.485522+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":17}}	{"id":"8d2d84ffd2187715f75e43bbc058d8eafef7d1854639818567caef29daf875d8","value":{"":[{"var":"city"},"Bangalore"]},"override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","created_at":"2024-05-02T04:13:27.485522+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":17}}	UPDATE "contexts" SET "id" = $1, "value" = $2, "priority" = $3 WHERE ("contexts"."id" = $4) RETURNING "contexts"."id", "contexts"."value", "contexts"."override_id", "contexts"."created_at", "contexts"."created_by", "contexts"."priority", "contexts"."override"
-5cd6abbd-eb6d-42dc-be10-9fb8a1b81695	contexts	postgres	2024-05-02 04:15:15.380716	INSERT	\N	{"id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191651430124621824-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-02T04:15:15.386908+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":10}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-3dbdb8a8-68e8-4152-9f77-1fe4bdadfee6	contexts	postgres	2024-05-02 04:15:15.380716	INSERT	\N	{"id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191651430124621824-experimental",{"var":"variantIds"}]}]},"override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","created_at":"2024-05-02T04:15:15.397603+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":18}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-1cd9b110-892f-45c3-ba7a-bf9a18c107a4	contexts	postgres	2024-05-02 04:15:39.33219	DELETE	{"id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191651430124621824-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-02T04:15:15.386908+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":10}}	\N	DELETE  FROM "contexts" WHERE ("contexts"."id" = $1)
-3f1a6ce5-03c5-421a-9de5-050670ba57db	contexts	postgres	2024-05-02 04:15:39.33219	DELETE	{"id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","value":{"and":[{"":[{"var":"city"},"Bangalore"]},{"in":["7191651430124621824-experimental",{"var":"variantIds"}]}]},"override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","created_at":"2024-05-02T04:15:15.397603+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":18}}	\N	DELETE  FROM "contexts" WHERE ("contexts"."id" = $1) RETURNING "contexts"."id", "contexts"."value", "contexts"."override_id", "contexts"."created_at", "contexts"."created_by", "contexts"."priority", "contexts"."override"
-a50f253c-979e-43e4-808d-1c0b3948a608	contexts	postgres	2024-05-02 04:15:39.33219	UPDATE	{"id":"8d2d84ffd2187715f75e43bbc058d8eafef7d1854639818567caef29daf875d8","value":{"":[{"var":"city"},"Bangalore"]},"override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","created_at":"2024-05-02T04:13:27.485522+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":17}}	{"id":"8d2d84ffd2187715f75e43bbc058d8eafef7d1854639818567caef29daf875d8","value":{"":[{"var":"city"},"Bangalore"]},"override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","created_at":"2024-05-02T04:15:39.347124+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":18}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-ad709096-5bd7-4654-b674-8531af20b83c	contexts	postgres	2024-05-02 07:23:51.387798	INSERT	\N	{"id":"5bf54e4783b83f91b2ae1e1d905a2897b007a657bc235475c3881b0f06b6f7a2","value":{"and":[{"":[{"var":"city"},"FooBar"]},{"in":["7191698892931600384-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-02T07:23:51.400605+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":10}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-757c203b-5b04-4e6d-9825-68e077ea8eb4	contexts	postgres	2024-05-02 07:23:51.387798	INSERT	\N	{"id":"81b9cf1f4ae22d89f5d3118d1019698abe46cfe481ca3593d61f2acc04bc498c","value":{"and":[{"":[{"var":"city"},"FooBar"]},{"in":["7191698892931600384-experimental",{"var":"variantIds"}]}]},"override_id":"16d291cd4d3204baecba99cd4e9b4a7978719df8265774f13679db03b17c0698","created_at":"2024-05-02T07:23:51.424615+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":43}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-11c7f09b-1e2b-439c-8446-140e298415e3	default_configs	postgres	2024-05-03 16:17:49.368894	INSERT	\N	{"key":"bar.com","value":12,"created_at":"2024-05-03T16:17:49.36615+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-827262a3-424e-423a-8c3f-60066be8f968	default_configs	postgres	2024-05-03 16:18:05.361893	INSERT	\N	{"key":"bar.baz","value":43,"created_at":"2024-05-03T16:18:05.358005+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-f1c192b4-2c2f-45b2-a008-c42420f7280b	default_configs	postgres	2024-05-05 07:54:40.99486	INSERT	\N	{"key":"base-fare","value":25.0,"created_at":"2024-05-05T07:54:40.987208+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-5fd5b38f-a9b7-4d91-a14c-86df8c754936	default_configs	postgres	2024-05-05 07:54:57.222327	INSERT	\N	{"key":"per-km-rate","value":15.0,"created_at":"2024-05-05T07:54:57.218143+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-a9c308ca-c1ab-47d3-aa87-cd28f3d0a58d	default_configs	postgres	2024-05-05 07:55:53.35989	INSERT	\N	{"key":"currency","value":"INR","created_at":"2024-05-05T07:55:53.354787+00:00","created_by":"superposition@juspay.in","schema":{"enum":["INR","USD","EUR"],"type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-01a44fb6-9481-47cc-91a0-8e32dd2dc5e5	default_configs	postgres	2024-05-05 10:48:53.407338	DELETE	{"key":"bar.com","value":12,"created_at":"2024-05-03T16:17:49.36615+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	\N	delete from dev_cac.default_configs where key = 'bar.com';
-9860722e-a8f9-44eb-93f7-2087206323e8	default_configs	postgres	2024-05-05 10:48:58.297119	DELETE	{"key":"bar.baz","value":43,"created_at":"2024-05-03T16:18:05.358005+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	\N	delete from dev_cac.default_configs where key = 'bar.baz';
-4c937453-61f7-4c14-b079-9f7140a00ffc	default_configs	postgres	2024-05-05 10:49:01.223898	DELETE	{"key":"foo","value":10,"created_at":"2024-05-01T12:16:09.93811+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	\N	delete from dev_cac.default_configs where key = 'foo';
-df9a6e18-06a9-48b1-99a9-4032f6ce69f0	contexts	postgres	2024-05-05 10:49:25.904006	DELETE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"7faf7ac21a000f465344c4c4b403fa62cd9f9a0caecd684fe566f06260677503","created_at":"2024-05-01T12:17:16.160015+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":12}}	\N	delete from dev_cac.contexts ;
-4c0cc8dd-866e-4405-8947-cf9362d339af	contexts	postgres	2024-05-05 10:49:25.904006	DELETE	{"id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","value":{"and":[{"in":["7191420957775499264-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-01T12:59:26.49421+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":10}}	\N	delete from dev_cac.contexts ;
-3ffa7086-85cc-4914-af07-4290e8a5ecd1	contexts	postgres	2024-05-05 10:49:25.904006	DELETE	{"id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","value":{"and":[{"in":["7191420957775499264-experimental",{"var":"variantIds"}]}]},"override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","created_at":"2024-05-01T12:59:26.521789+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":14}}	\N	delete from dev_cac.contexts ;
-567e1d3a-9592-434e-be39-fd6f2ef2ce4d	contexts	postgres	2024-05-05 10:49:25.904006	DELETE	{"id":"8d2d84ffd2187715f75e43bbc058d8eafef7d1854639818567caef29daf875d8","value":{"":[{"var":"city"},"Bangalore"]},"override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","created_at":"2024-05-02T04:15:39.347124+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"foo":18}}	\N	delete from dev_cac.contexts ;
-b4500fb1-e921-49ab-8a2d-139933a00d5c	contexts	postgres	2024-05-05 10:49:25.904006	DELETE	{"id":"5bf54e4783b83f91b2ae1e1d905a2897b007a657bc235475c3881b0f06b6f7a2","value":{"and":[{"":[{"var":"city"},"FooBar"]},{"in":["7191698892931600384-control",{"var":"variantIds"}]}]},"override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","created_at":"2024-05-02T07:23:51.400605+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":10}}	\N	delete from dev_cac.contexts ;
-8448eddf-726a-4745-a7ed-909ecd2489b1	contexts	postgres	2024-05-05 10:49:25.904006	DELETE	{"id":"81b9cf1f4ae22d89f5d3118d1019698abe46cfe481ca3593d61f2acc04bc498c","value":{"and":[{"":[{"var":"city"},"FooBar"]},{"in":["7191698892931600384-experimental",{"var":"variantIds"}]}]},"override_id":"16d291cd4d3204baecba99cd4e9b4a7978719df8265774f13679db03b17c0698","created_at":"2024-05-02T07:23:51.424615+00:00","created_by":"superposition@juspay.in","priority":2,"override":{"foo":43}}	\N	delete from dev_cac.contexts ;
-7b36c78f-09a3-42f0-a073-0b9936be9654	default_configs	postgres	2024-05-05 10:53:08.167611	DELETE	{"key":"base-fare","value":25.0,"created_at":"2024-05-05T07:54:40.987208+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	\N	delete from dev_cac.default_configs ;
-4efe88b1-61db-4642-b63d-14d4ad5d7eac	default_configs	postgres	2024-05-05 10:53:08.167611	DELETE	{"key":"per-km-rate","value":15.0,"created_at":"2024-05-05T07:54:57.218143+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	\N	delete from dev_cac.default_configs ;
-322d902e-449b-4f90-b5c6-f7ca6982ac25	default_configs	postgres	2024-05-05 10:53:08.167611	DELETE	{"key":"currency","value":"INR","created_at":"2024-05-05T07:55:53.354787+00:00","created_by":"superposition@juspay.in","schema":{"enum":["INR","USD","EUR"],"type":"string"},"function_name":null}	\N	delete from dev_cac.default_configs ;
-bb85d46f-1707-49d1-b043-a3c27e0aad75	default_configs	postgres	2024-05-05 10:53:22.663514	INSERT	\N	{"key":"base_rate","value":10.0,"created_at":"2024-05-05T10:53:22.654911+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-271c1ba9-68f4-4b17-a32a-03ee035f2f08	default_configs	postgres	2024-05-05 10:53:38.959564	INSERT	\N	{"key":"per_km_rate","value":15.0,"created_at":"2024-05-05T10:53:38.957119+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-423b5a40-026d-481d-92ea-39441b553c64	default_configs	postgres	2024-05-05 10:54:07.600067	INSERT	\N	{"key":"currency","value":"INR","created_at":"2024-05-05T10:54:07.595371+00:00","created_by":"superposition@juspay.in","schema":{"enum":["INR","USD","EUR"],"type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-e01a8e7b-7895-413c-a0f2-871f4e1bfd3b	contexts	postgres	2024-05-05 14:56:12.253026	INSERT	\N	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"5dfab853b336d9bcac2b24af9690060c730f185cc3709b030a76afc1ce7261ad","created_at":"2024-05-05T14:56:12.2485+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":25,"currency":"INR","per_km_rate":5}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-83f2719a-fbe9-4123-923c-844857e4f300	contexts	postgres	2024-05-05 15:02:22.520244	INSERT	\N	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"5152412bb4f8df280529d1db745b776ecf7503a7217da8f92e3c954c5bd41389","created_at":"2024-05-05T15:02:22.516258+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":40,"per_km_rate":25}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-5df4e77c-4925-4257-b7ec-fa1874d50365	contexts	postgres	2024-05-05 17:19:50.72273	INSERT	\N	{"id":"f12e3bcd17b3166d8d2cf98bbc0d65ed84057975f11bd3894a4310b900c52c9f","value":{"==":[{"var":"city"},"Paris"]},"override_id":"392ac624c4647cc2d67cc85e0aacabb571f74400290bd729ba905ac70ca47451","created_at":"2024-05-05T17:19:50.719846+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"EUR","per_km_rate":3}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-0f4aa355-9d99-4816-b62d-c3bc9f2510b8	default_configs	postgres	2024-05-06 06:37:10.686609	INSERT	\N	{"key":"distance_unit","value":"kilometres","created_at":"2024-05-06T06:37:10.674057+00:00","created_by":"superposition@juspay.in","schema":{"enum":["kilometres","miles"],"type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-7f776f86-e31d-4aa2-b3a1-e0ae844c3156	default_configs	postgres	2024-05-06 06:40:16.765211	UPDATE	{"key":"per_km_rate","value":15.0,"created_at":"2024-05-05T10:53:38.957119+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	{"key":"per_distance_unit_rate","value":15.0,"created_at":"2024-05-05T10:53:38.957119+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	update dev_cac.default_configs  set key = 'per_distance_unit_rate' where key = 'per_km_rate';
-7a90eb5f-9812-402b-bb37-a870bfe41a7c	contexts	postgres	2024-05-06 06:40:29.521695	DELETE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"5dfab853b336d9bcac2b24af9690060c730f185cc3709b030a76afc1ce7261ad","created_at":"2024-05-05T14:56:12.2485+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":25,"currency":"INR","per_km_rate":5}}	\N	delete from dev_cac.contexts ;
-acbc9088-4b1f-4b40-8a93-22a9a0446d4f	contexts	postgres	2024-05-06 06:40:29.521695	DELETE	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"5152412bb4f8df280529d1db745b776ecf7503a7217da8f92e3c954c5bd41389","created_at":"2024-05-05T15:02:22.516258+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":40,"per_km_rate":25}}	\N	delete from dev_cac.contexts ;
-b0ddc4b4-fdb4-4df6-ba9e-1d23847feeca	contexts	postgres	2024-05-06 06:40:29.521695	DELETE	{"id":"f12e3bcd17b3166d8d2cf98bbc0d65ed84057975f11bd3894a4310b900c52c9f","value":{"==":[{"var":"city"},"Paris"]},"override_id":"392ac624c4647cc2d67cc85e0aacabb571f74400290bd729ba905ac70ca47451","created_at":"2024-05-05T17:19:50.719846+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"EUR","per_km_rate":3}}	\N	delete from dev_cac.contexts ;
-ea6ca8b3-a075-4f1a-a7dc-dccb98bdff03	contexts	postgres	2024-05-06 06:41:33.312274	INSERT	\N	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"71687fff7d7e42f6d3962999344f1bc8a5aed12785a2d5851f63298896c56392","created_at":"2024-05-06T06:41:33.309596+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":20,"currency":"INR","distance_unit":"kilometres","per_distance_unit_rate":15}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-23936b31-e631-464e-aeb6-f6686ea5d1a6	contexts	postgres	2024-05-06 06:41:45.596988	INSERT	\N	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"19339f445abe140836795d6068a887c9e1697496269a1486da02f73f59d93821","created_at":"2024-05-06T06:41:45.593764+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":25,"currency":"INR","distance_unit":"kilometres","per_distance_unit_rate":20}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-2bf7ebd6-1c9b-4b3c-880e-4184ab90f5ed	contexts	postgres	2024-05-06 06:58:48.727481	INSERT	\N	{"id":"1672b4b6f0a3e9729cce608d8cb013e5cdffcbca59464e85114f4b4731eb8a35","value":{"==":[{"var":"city"},"New York"]},"override_id":"15c70cfe4602e1df69ce5353f590f6a1de2d10df8bce991a28e32e5f7ba0e026","created_at":"2024-05-06T06:58:48.723229+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"USD","distance_unit":"miles","per_distance_unit_rate":2.5}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-ad992a6a-ae69-4f74-bcea-453ef8b17e97	contexts	postgres	2024-05-06 07:02:08.017873	DELETE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"71687fff7d7e42f6d3962999344f1bc8a5aed12785a2d5851f63298896c56392","created_at":"2024-05-06T06:41:33.309596+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":20,"currency":"INR","distance_unit":"kilometres","per_distance_unit_rate":15}}	\N	delete from dev_cac.contexts ;
-2c2f518f-3473-4c03-bc37-01a903ce945c	contexts	postgres	2024-05-06 07:02:08.017873	DELETE	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"19339f445abe140836795d6068a887c9e1697496269a1486da02f73f59d93821","created_at":"2024-05-06T06:41:45.593764+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":25,"currency":"INR","distance_unit":"kilometres","per_distance_unit_rate":20}}	\N	delete from dev_cac.contexts ;
-bc8b7490-c840-4a20-b0fb-a2bc9ce33df8	contexts	postgres	2024-05-06 07:02:08.017873	DELETE	{"id":"1672b4b6f0a3e9729cce608d8cb013e5cdffcbca59464e85114f4b4731eb8a35","value":{"==":[{"var":"city"},"New York"]},"override_id":"15c70cfe4602e1df69ce5353f590f6a1de2d10df8bce991a28e32e5f7ba0e026","created_at":"2024-05-06T06:58:48.723229+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"USD","distance_unit":"miles","per_distance_unit_rate":2.5}}	\N	delete from dev_cac.contexts ;
-960edc22-3a48-4111-87bc-550f72c0ef39	dimensions	postgres	2024-05-06 06:42:47.707076	UPDATE	{"dimension":"city","priority":1,"created_at":"2024-05-01T12:16:59.242405+00:00","created_by":"superposition@juspay.in","schema":{"pattern":"[a-zA-Z]+","type":"string"},"function_name":null}	{"dimension":"city","priority":1,"created_at":"2024-05-06T06:42:47.70463+00:00","created_by":"superposition@juspay.in","schema":{"pattern":"[a-zA-Z ]+","type":"string"},"function_name":null}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name"
-39752f99-b8dc-4685-b9cb-9166682bf434	default_configs	postgres	2024-05-06 07:01:59.166724	UPDATE	{"key":"distance_unit","value":"kilometres","created_at":"2024-05-06T06:37:10.674057+00:00","created_by":"superposition@juspay.in","schema":{"enum":["kilometres","miles"],"type":"string"},"function_name":null}	{"key":"distance_unit","value":"Km","created_at":"2024-05-06T07:01:59.163885+00:00","created_by":"superposition@juspay.in","schema":{"enum":["Km","Miles"],"type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-19c9977a-470a-4215-91b4-1771daed6d3d	contexts	postgres	2024-05-06 07:02:48.724584	INSERT	\N	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"795dc46ccb2b513104f7e7f1688b7f20a04502b6afaa7dbf68ae7a4588c94fde","created_at":"2024-05-06T07:02:48.718942+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","per_distance_unit_rate":15}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-ca009789-9c9e-4c84-8c3e-bb9a2766a744	contexts	postgres	2024-05-06 07:05:52.998888	INSERT	\N	{"id":"1672b4b6f0a3e9729cce608d8cb013e5cdffcbca59464e85114f4b4731eb8a35","value":{"==":[{"var":"city"},"New York"]},"override_id":"00e985580ef9edb57d54e30de21acca2449cecda239e23be60d9bae6270f847c","created_at":"2024-05-06T07:05:52.994267+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","per_distance_unit_rate":2.5}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-806ac0e5-6f89-4f2d-9a0e-45330b939ae3	contexts	postgres	2024-05-06 07:07:34.312018	DELETE	{"id":"1672b4b6f0a3e9729cce608d8cb013e5cdffcbca59464e85114f4b4731eb8a35","value":{"==":[{"var":"city"},"New York"]},"override_id":"00e985580ef9edb57d54e30de21acca2449cecda239e23be60d9bae6270f847c","created_at":"2024-05-06T07:05:52.994267+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","per_distance_unit_rate":2.5}}	\N	delete from dev_cac.contexts where id = '1672b4b6f0a3e9729cce608d8cb013e5cdffcbca59464e85114f4b4731eb8a35';
-45a494b6-09d2-4c9c-adbc-151118ca019c	contexts	postgres	2024-05-06 07:08:11.416527	INSERT	\N	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"00e985580ef9edb57d54e30de21acca2449cecda239e23be60d9bae6270f847c","created_at":"2024-05-06T07:08:11.41364+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","per_distance_unit_rate":2.5}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-a0ae41dc-f30a-467d-a8eb-b1af161d5f7c	default_configs	postgres	2024-05-07 15:02:11.517048	INSERT	\N	{"key":"bar.com","value":10,"created_at":"2024-05-07T15:02:11.504644+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-eb7b97c5-e11a-40e3-b4e6-e926ad926f83	default_configs	postgres	2024-05-07 15:02:31.134231	INSERT	\N	{"key":"bar.foo","value":10.0,"created_at":"2024-05-07T15:02:31.131308+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-15a84e44-06e9-4373-b3e7-03b890d25322	dimensions	postgres	2024-05-07 17:44:05.1437	INSERT	\N	{"dimension":"vehicle_type","priority":2,"created_at":"2024-05-07T17:44:05.136115+00:00","created_by":"superposition@juspay.in","schema":{"enum":["cab","auto"],"type":"string"},"function_name":null}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name"
-d586c6ad-5c07-4b9f-94b6-621579663e74	dimensions	postgres	2024-05-07 17:44:11.247902	UPDATE	{"dimension":"city","priority":1,"created_at":"2024-05-06T06:42:47.70463+00:00","created_by":"superposition@juspay.in","schema":{"pattern":"[a-zA-Z ]+","type":"string"},"function_name":null}	{"dimension":"city","priority":2,"created_at":"2024-05-07T17:44:11.244241+00:00","created_by":"superposition@juspay.in","schema":{"pattern":"[a-zA-Z ]+","type":"string"},"function_name":null}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name"
-e5b90531-ad8c-4157-934c-f25fd13b3bd2	dimensions	postgres	2024-05-07 17:44:16.718568	UPDATE	{"dimension":"city","priority":2,"created_at":"2024-05-07T17:44:11.244241+00:00","created_by":"superposition@juspay.in","schema":{"pattern":"[a-zA-Z ]+","type":"string"},"function_name":null}	{"dimension":"city","priority":4,"created_at":"2024-05-07T17:44:16.716277+00:00","created_by":"superposition@juspay.in","schema":{"pattern":"[a-zA-Z ]+","type":"string"},"function_name":null}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name"
-6df10707-60bc-4de5-bf4d-48ea4270c7be	contexts	postgres	2024-05-07 17:51:39.33541	INSERT	\N	{"id":"9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc","value":{"and":[{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"vehicle_type"},"cab"]}]},"override_id":"e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede","created_at":"2024-05-07T17:51:39.330747+00:00","created_by":"superposition@juspay.in","priority":6,"override":{"base_rate":12}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-dd1bbf71-7a83-4940-bb55-28ac59747e21	dimensions	postgres	2024-05-08 08:01:36.622328	INSERT	\N	{"dimension":"hour_of_day","priority":32,"created_at":"2024-05-08T08:01:36.617931+00:00","created_by":"superposition@juspay.in","schema":{"type":"number"},"function_name":null}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name"
-2874b23f-39ff-480a-ba8c-ab4bbf382aa2	contexts	postgres	2024-05-08 08:02:50.14613	INSERT	\N	{"id":"d8256cd0c9fbbfae460057ed14f0630f4dd0b050cf271832b0c9bfb5e31ca43b","value":{"and":[{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"hour_of_day"},9]}]},"override_id":"204dc317acb302d38289cbfbc3227461d45bdde8dc5bfc0f6f961a8bb476e910","created_at":"2024-05-08T08:02:50.144267+00:00","created_by":"superposition@juspay.in","priority":38,"override":{"base_rate":100,"per_distance_unit_rate":50}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-c78499a0-2a7f-4cd5-baa7-172397d46069	default_configs	postgres	2024-05-08 09:12:55.795319	INSERT	\N	{"key":"hello_message","value":"","created_at":"2024-05-08T09:12:55.781855+00:00","created_by":"superposition@juspay.in","schema":{"pattern":".*","type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-bb762a1c-fb3a-462c-a4fa-c948152ff6cc	default_configs	postgres	2024-05-08 09:13:14.016507	UPDATE	{"key":"hello_message","value":"","created_at":"2024-05-08T09:12:55.781855+00:00","created_by":"superposition@juspay.in","schema":{"pattern":".*","type":"string"},"function_name":null}	{"key":"hello_message","value":"Hello World !!!","created_at":"2024-05-08T09:13:14.009736+00:00","created_by":"superposition@juspay.in","schema":{"pattern":".*","type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-806af1ae-8580-445d-b8d1-7ba092d4ece6	contexts	postgres	2024-05-08 09:15:03.014944	UPDATE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"795dc46ccb2b513104f7e7f1688b7f20a04502b6afaa7dbf68ae7a4588c94fde","created_at":"2024-05-06T07:02:48.718942+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","per_distance_unit_rate":15}}	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"4da0308c37eaa8bd32f4b857d6fac95eb7305f38610f13ff048217f741af4381","created_at":"2024-05-08T09:15:03.004255+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮ್ಮ ಬೆಂಗಳೂರು","per_distance_unit_rate":15}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-f2a1d7ad-7ed2-4513-8065-8a0ab2e127bc	contexts	postgres	2024-05-08 09:38:24.978965	INSERT	\N	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"024af06619749624e28e725a062ae988c3827ab8fa439565dcac218a4d6f2df8","created_at":"2024-05-08T09:38:24.97809+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"hello_message":"வணக்கம் சென்னை"}}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override") VALUES ($1, $2, $3, $4, $5, $6, $7)
-1d607447-5bea-4d65-abbe-aee152606137	default_configs	postgres	2024-05-08 10:25:50.555039	INSERT	\N	{"key":"hello_message_color","value":"black","created_at":"2024-05-08T10:25:50.551915+00:00","created_by":"superposition@juspay.in","schema":{"enum":["black","red","blue","green","pink"],"type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-48884ece-d45f-459c-b066-3c6bd6a93a02	contexts	postgres	2024-05-08 10:28:06.68553	UPDATE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"4da0308c37eaa8bd32f4b857d6fac95eb7305f38610f13ff048217f741af4381","created_at":"2024-05-08T09:15:03.004255+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮ್ಮ ಬೆಂಗಳೂರು","per_distance_unit_rate":15}}	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"f2e29b63c08871a60ee3c2f4c66cc6772ee596f462d6f4bf1bd8ab6198da457b","created_at":"2024-05-08T10:28:06.674859+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮ್ಮ ಬೆಂಗಳೂರು","hello_message_color":"pink","per_distance_unit_rate":15}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-67c1882d-c15d-45bf-99f2-39eedc7e323a	contexts	postgres	2024-05-08 10:28:33.152792	UPDATE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"f2e29b63c08871a60ee3c2f4c66cc6772ee596f462d6f4bf1bd8ab6198da457b","created_at":"2024-05-08T10:28:06.674859+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮ್ಮ ಬೆಂಗಳೂರು","hello_message_color":"pink","per_distance_unit_rate":15}}	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"a11cf3b9993dcc9e9676b42b18f1a2a88e76a4708096423eb5299f542eee30f9","created_at":"2024-05-08T10:28:33.140039+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮ್ಮ ಬೆಂಗಳೂರು","hello_message_color":"red","per_distance_unit_rate":15}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-8810fc14-28cb-4b83-8da3-35d09665cc58	contexts	postgres	2024-05-08 10:28:51.965506	UPDATE	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"024af06619749624e28e725a062ae988c3827ab8fa439565dcac218a4d6f2df8","created_at":"2024-05-08T09:38:24.97809+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"hello_message":"வணக்கம் சென்னை"}}	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"f861adc6d826c313d638bfee24e531a10bf4da060a2499c29772e9d9e80f4da2","created_at":"2024-05-08T10:28:51.959772+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green"}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-756bde30-813f-47a1-854e-cc1a0de88313	contexts	postgres	2024-05-08 10:29:52.294663	UPDATE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"a11cf3b9993dcc9e9676b42b18f1a2a88e76a4708096423eb5299f542eee30f9","created_at":"2024-05-08T10:28:33.140039+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮ್ಮ ಬೆಂಗಳೂರು","hello_message_color":"red","per_distance_unit_rate":15}}	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"eead504894c48cc5d1c03ceee57097fba335116ae9cbad2e84fce9cf10797d8c","created_at":"2024-05-08T10:29:52.286889+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","per_distance_unit_rate":15}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-63ef0485-fbf9-4b58-81b4-79bc86f953b0	contexts	postgres	2024-05-08 10:33:30.533295	UPDATE	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"00e985580ef9edb57d54e30de21acca2449cecda239e23be60d9bae6270f847c","created_at":"2024-05-06T07:08:11.41364+00:00","created_by":"superposition@juspay.in","priority":1,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","per_distance_unit_rate":2.5}}	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"014160b8e1f1c1f80c4e9c2e2c6614e72fb0917e2c9109602788b2ecaf64ef0f","created_at":"2024-05-08T10:33:30.518223+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","per_distance_unit_rate":2.5}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-d2fc0f9a-4631-4631-a5fa-3276ca3ed2fe	contexts	postgres	2024-05-08 10:34:25.099774	UPDATE	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"014160b8e1f1c1f80c4e9c2e2c6614e72fb0917e2c9109602788b2ecaf64ef0f","created_at":"2024-05-08T10:33:30.518223+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","per_distance_unit_rate":2.5}}	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"de147cd0db5fb97de6a60fe45c54aec01ef1cc7c02659110d5899486b8c95257","created_at":"2024-05-08T10:34:25.089476+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","per_distance_unit_rate":2.5}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-a2ae8276-20fa-489a-8d30-2e09f116bd21	default_configs	postgres	2024-05-10 14:44:29.40222	INSERT	\N	{"key":"logo","value":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","created_at":"2024-05-10T14:44:29.391516+00:00","created_by":"user@superposition.io","schema":{"pattern":"https://.*","type":"string"},"function_name":null}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name") VALUES ($1, $2, $3, $4, $5, DEFAULT) ON CONFLICT ("key") DO UPDATE SET "value" = $6, "created_at" = $7, "created_by" = $8, "schema" = $9, "function_name" = $10
-f29d4303-fb76-4b25-912c-e673142b175e	contexts	postgres	2024-05-10 14:45:07.776303	UPDATE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"eead504894c48cc5d1c03ceee57097fba335116ae9cbad2e84fce9cf10797d8c","created_at":"2024-05-08T10:29:52.286889+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","per_distance_unit_rate":15}}	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153","created_at":"2024-05-10T14:45:07.769368+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-755bce98-ea99-4ec8-aff9-835f1b73dd91	contexts	postgres	2024-05-10 14:45:34.793726	UPDATE	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"f861adc6d826c313d638bfee24e531a10bf4da060a2499c29772e9d9e80f4da2","created_at":"2024-05-08T10:28:51.959772+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green"}}	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"d6ee14a723773959add518b640becd77978f93799a878a6d2ead04a578902849","created_at":"2024-05-10T14:45:34.785525+00:00","created_by":"user@superposition.io","priority":4,"override":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://upload.wikimedia.org/wikipedia/commons/d/d9/Inside_Chennai_logo.png"}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-3e17da47-d882-4de8-8504-8eeb5f5f9abd	contexts	postgres	2024-05-10 14:45:47.949706	UPDATE	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"de147cd0db5fb97de6a60fe45c54aec01ef1cc7c02659110d5899486b8c95257","created_at":"2024-05-08T10:34:25.089476+00:00","created_by":"superposition@juspay.in","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","per_distance_unit_rate":2.5}}	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"e425ad03b83e0ee850581973a7da762e93f12e607eed79ab7d84648bc7507fa5","created_at":"2024-05-10T14:45:47.946646+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://i.pinimg.com/originals/1e/5a/f4/1e5af416b9756d32cf1c1daa87f2682e.jpg","per_distance_unit_rate":2.5}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-7bf4fb23-cc1e-4f70-aa5c-926f6ce687b4	contexts	postgres	2024-05-10 14:48:42.132738	UPDATE	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"d6ee14a723773959add518b640becd77978f93799a878a6d2ead04a578902849","created_at":"2024-05-10T14:45:34.785525+00:00","created_by":"user@superposition.io","priority":4,"override":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://upload.wikimedia.org/wikipedia/commons/d/d9/Inside_Chennai_logo.png"}}	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b","created_at":"2024-05-10T14:48:42.122682+00:00","created_by":"user@superposition.io","priority":4,"override":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
-96ce4c3f-3a08-4c44-b9b3-adfcc7f3ae7b	contexts	postgres	2024-05-10 14:50:19.475281	UPDATE	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"e425ad03b83e0ee850581973a7da762e93f12e607eed79ab7d84648bc7507fa5","created_at":"2024-05-10T14:45:47.946646+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://i.pinimg.com/originals/1e/5a/f4/1e5af416b9756d32cf1c1daa87f2682e.jpg","per_distance_unit_rate":2.5}}	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69","created_at":"2024-05-10T14:50:19.471563+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}}	UPDATE "contexts" SET "value" = $1, "override_id" = $2, "created_at" = $3, "created_by" = $4, "priority" = $5, "override" = $6 WHERE ("contexts"."id" = $7)
 \.
 
 
@@ -3963,6 +5053,26 @@ COPY dev_cac.event_log_y2024m07 (id, table_name, user_name, "timestamp", action,
 --
 
 COPY dev_cac.event_log_y2024m08 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+793b78ad-e6b9-4110-ad2c-0327ec39a298	dimensions	postgres	2024-08-22 12:05:35.298665	INSERT	\N	{"dimension":"variantIds","priority":1,"created_at":"2024-08-22T12:05:35.298665+00:00","created_by":"user@example.com","schema":{"type": "string","pattern": ".*"},"function_name":null,"last_modified_at":"2024-08-22T12:05:35.298665","last_modified_by":"null"}	INSERT INTO dev_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name) VALUES ('variantIds', 1, CURRENT_TIMESTAMP, 'user@example.com', '{"type": "string","pattern": ".*"}'::json, null);
+2fba7469-1df3-4f76-aa73-c0debf40f05c	dimensions	postgres	2024-08-22 12:08:29.15758	INSERT	\N	{"dimension":"vehicle_type","priority":2,"created_at":"2024-08-22T12:08:29.152994+00:00","created_by":"user@superposition.io","schema":{"enum":["cab","auto"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T12:08:29.153249","last_modified_by":"user@superposition.io"}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name", "dimensions"."last_modified_at", "dimensions"."last_modified_by"
+f495f584-366b-4564-9deb-8b1ad1f064c1	dimensions	postgres	2024-08-22 12:08:56.442895	INSERT	\N	{"dimension":"city","priority":4,"created_at":"2024-08-22T12:08:56.435259+00:00","created_by":"user@superposition.io","schema":{"pattern":"[a-zA-Z ]+","type":"string"},"function_name":null,"last_modified_at":"2024-08-22T12:08:56.435264","last_modified_by":"user@superposition.io"}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name", "dimensions"."last_modified_at", "dimensions"."last_modified_by"
+7b9adcc7-7117-4f89-8e69-ffebf66b1c28	dimensions	postgres	2024-08-22 12:09:12.116893	INSERT	\N	{"dimension":"hour_of_day","priority":32,"created_at":"2024-08-22T12:09:12.112655+00:00","created_by":"user@superposition.io","schema":{"type":"number"},"function_name":null,"last_modified_at":"2024-08-22T12:09:12.112665","last_modified_by":"user@superposition.io"}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name", "dimensions"."last_modified_at", "dimensions"."last_modified_by"
+80468043-5662-4330-b562-14e1410bb1ba	functions	postgres	2024-08-22 12:10:44.420382	INSERT	\N	{"function_name":"axios_validator_example","published_code":null,"draft_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","function_description":"An example function that shows off validator functions","published_runtime_version":null,"draft_runtime_version":"1.0.0","published_at":null,"draft_edited_at":"2024-08-22T12:10:44.416185","published_by":null,"draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T12:10:44.416187","last_modified_by":"user@superposition.io"}	INSERT INTO "functions" ("function_name", "published_code", "draft_code", "function_description", "published_runtime_version", "draft_runtime_version", "published_at", "draft_edited_at", "published_by", "draft_edited_by", "last_modified_at", "last_modified_by") VALUES ($1, DEFAULT, $2, $3, DEFAULT, $4, DEFAULT, $5, DEFAULT, $6, $7, $8) RETURNING "functions"."function_name", "functions"."published_code", "functions"."draft_code", "functions"."function_description", "functions"."published_runtime_version", "functions"."draft_runtime_version", "functions"."published_at", "functions"."draft_edited_at", "functions"."published_by", "functions"."draft_edited_by", "functions"."last_modified_at", "functions"."last_modified_by"
+76df90b7-bb2b-45f3-aceb-8c980b3f5801	functions	postgres	2024-08-22 12:10:48.788942	UPDATE	{"function_name":"axios_validator_example","published_code":null,"draft_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","function_description":"An example function that shows off validator functions","published_runtime_version":null,"draft_runtime_version":"1.0.0","published_at":null,"draft_edited_at":"2024-08-22T12:10:44.416185","published_by":null,"draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T12:10:44.416187","last_modified_by":"user@superposition.io"}	{"function_name":"axios_validator_example","published_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","draft_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","function_description":"An example function that shows off validator functions","published_runtime_version":"1.0.0","draft_runtime_version":"1.0.0","published_at":"2024-08-22T12:10:48.787527","draft_edited_at":"2024-08-22T12:10:44.416185","published_by":"user@superposition.io","draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T12:10:44.416187","last_modified_by":"user@superposition.io"}	UPDATE "functions" SET "published_code" = $1, "published_runtime_version" = $2, "published_by" = $3, "published_at" = $4 WHERE ("functions"."function_name" = $5) RETURNING "functions"."function_name", "functions"."published_code", "functions"."draft_code", "functions"."function_description", "functions"."published_runtime_version", "functions"."draft_runtime_version", "functions"."published_at", "functions"."draft_edited_at", "functions"."published_by", "functions"."draft_edited_by", "functions"."last_modified_at", "functions"."last_modified_by"
+0331b8d6-f34d-436f-9991-05bae112ae5e	default_configs	postgres	2024-08-22 12:11:28.124147	INSERT	\N	{"key":"base_rate","value":10.0,"created_at":"2024-08-22T12:11:28.122453+00:00","created_by":"user@superposition.io","schema":{"type":"number"},"function_name":null,"last_modified_at":"2024-08-22T12:11:28.122802","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+520aee64-d0c6-4728-990e-85b22fa3d8a1	default_configs	postgres	2024-08-22 12:12:19.767051	INSERT	\N	{"key":"currency","value":"INR","created_at":"2024-08-22T12:12:19.765579+00:00","created_by":"user@superposition.io","schema":{"enum":["INR","USD","EUR"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T12:12:19.765591","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+658acd0e-290c-4905-9aa1-626624ed49b2	default_configs	postgres	2024-08-22 12:12:53.815329	INSERT	\N	{"key":"distance_unit","value":"Km","created_at":"2024-08-22T12:12:53.814292+00:00","created_by":"user@superposition.io","schema":{"enum":["Km","Miles"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T12:12:53.814303","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+4e267194-f1ec-4e5b-88b2-5f75388400b6	default_configs	postgres	2024-08-22 12:14:27.222883	INSERT	\N	{"key":"hello_message_color","value":"black","created_at":"2024-08-22T12:14:27.222544+00:00","created_by":"user@superposition.io","schema":{"enum":["black","red","blue","green","pink"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T12:14:27.222551","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+f8290731-67b3-4a94-9985-5335aa309056	default_configs	postgres	2024-08-22 12:12:37.371593	INSERT	\N	{"key":"per_distance_unit_rate","value":15.0,"created_at":"2024-08-22T12:12:37.370436+00:00","created_by":"user@superposition.io","schema":{"type":"number"},"function_name":null,"last_modified_at":"2024-08-22T12:12:37.370446","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+aafbb4dc-5aea-469c-8d63-ecdbe08bc111	default_configs	postgres	2024-08-22 12:13:24.430688	INSERT	\N	{"key":"foo.foo","value":1,"created_at":"2024-08-22T12:13:24.43122+00:00","created_by":"user@superposition.io","schema":{"type":"integer"},"function_name":null,"last_modified_at":"2024-08-22T12:13:24.431231","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+b5cb1349-5048-4eb9-8178-4c82d0fa3895	default_configs	postgres	2024-08-22 12:13:37.788889	INSERT	\N	{"key":"foo.bar","value":2,"created_at":"2024-08-22T12:13:37.788173+00:00","created_by":"user@superposition.io","schema":{"type":"number"},"function_name":null,"last_modified_at":"2024-08-22T12:13:37.788184","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+a0e4d158-38b2-44f3-a9cd-650190510100	default_configs	postgres	2024-08-22 12:14:02.508721	INSERT	\N	{"key":"hello_message","value":"Hello World !!!","created_at":"2024-08-22T12:14:02.505322+00:00","created_by":"user@superposition.io","schema":{"pattern":".*","type":"string"},"function_name":null,"last_modified_at":"2024-08-22T12:14:02.505334","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+4e248746-a41d-4968-84e0-5d64dc89f1dc	default_configs	postgres	2024-08-22 12:15:09.467582	INSERT	\N	{"key":"logo","value":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","created_at":"2024-08-22T12:15:08.701643+00:00","created_by":"user@superposition.io","schema":{"pattern":"https://.*","type":"string"},"function_name":"axios_validator_example","last_modified_at":"2024-08-22T12:15:08.701648","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT ("key") DO UPDATE SET "value" = $9, "created_at" = $10, "created_by" = $11, "schema" = $12, "function_name" = $13, "last_modified_at" = $14, "last_modified_by" = $15
+eca10992-d451-49ae-9090-fad34a7c937d	contexts	postgres	2024-08-22 12:16:35.103289	INSERT	\N	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"be6a0ddbb08dae3007756cdc2be0676b94328b339f23cdfed5401b501c2c92fa","created_at":"2024-08-22T12:16:35.579131+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"\\thttps://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"last_modified_at":"2024-08-22T12:16:35.579132","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+4d35ebb2-8d1f-47d7-b692-ce9dc2f3cbf9	contexts	postgres	2024-08-22 12:16:43.5698	UPDATE	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"be6a0ddbb08dae3007756cdc2be0676b94328b339f23cdfed5401b501c2c92fa","created_at":"2024-08-22T12:16:35.579131+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"\\thttps://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"last_modified_at":"2024-08-22T12:16:35.579132","last_modified_by":"user@superposition.io"}	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"2a2eb08ced59872063128fc531b17a04e0e3be31d565b57273508008b207636a","created_at":"2024-08-22T12:16:35.579131+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":20,"distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"last_modified_at":"2024-08-22T12:16:43.897928","last_modified_by":"user@superposition.io"}	UPDATE "contexts" SET "override" = $1, "override_id" = $2, "last_modified_at" = $3, "last_modified_by" = $4 WHERE ("contexts"."id" = $5) RETURNING "contexts"."id", "contexts"."value", "contexts"."override_id", "contexts"."created_at", "contexts"."created_by", "contexts"."priority", "contexts"."override", "contexts"."last_modified_at", "contexts"."last_modified_by"
+c344f6ed-b996-4b01-8c4a-d0605799a53b	contexts	postgres	2024-08-22 12:36:23.004557	INSERT	\N	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b","created_at":"2024-08-22T12:36:23.489214+00:00","created_by":"user@superposition.io","priority":4,"override":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"last_modified_at":"2024-08-22T12:36:23.489216","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+fab51b58-20f8-4a2e-8a87-ea3d07fcab06	contexts	postgres	2024-08-22 12:37:31.773998	INSERT	\N	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69","created_at":"2024-08-22T12:37:32.306949+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5},"last_modified_at":"2024-08-22T12:37:32.306953","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+11321d35-13c7-458b-b7fc-d463164780ac	contexts	postgres	2024-08-22 12:37:53.174162	INSERT	\N	{"id":"9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc","value":{"and":[{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"vehicle_type"},"cab"]}]},"override_id":"e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede","created_at":"2024-08-22T12:37:53.206065+00:00","created_by":"user@superposition.io","priority":6,"override":{"base_rate":12},"last_modified_at":"2024-08-22T12:37:53.206068","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 \.
 
 
@@ -4194,7 +5304,22 @@ COPY dev_cac.event_log_y2026m12 (id, table_name, user_name, "timestamp", action,
 -- Data for Name: functions; Type: TABLE DATA; Schema: dev_cac; Owner: postgres
 --
 
-COPY dev_cac.functions (function_name, published_code, draft_code, function_description, published_runtime_version, draft_runtime_version, published_at, draft_edited_at, published_by, draft_edited_by) FROM stdin;
+COPY dev_cac.functions (function_name, published_code, draft_code, function_description, published_runtime_version, draft_runtime_version, published_at, draft_edited_at, published_by, draft_edited_by, last_modified_at, last_modified_by) FROM stdin;
+axios_validator_example	YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==	YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==	An example function that shows off validator functions	1.0.0	1.0.0	2024-08-22 12:10:48.787527	2024-08-22 12:10:44.416185	user@superposition.io	user@superposition.io	2024-08-22 12:10:44.416187	user@superposition.io
+\.
+
+
+--
+-- Data for Name: type_templates; Type: TABLE DATA; Schema: dev_cac; Owner: postgres
+--
+
+COPY dev_cac.type_templates (type_name, type_schema, created_by, created_at, last_modified_at, last_modified_by) FROM stdin;
+Number	{"type": "integer"}	user@superposition.io	2024-08-22 12:05:34.969937	2024-08-22 12:05:34.969937	null
+Decimal	{"type": "number"}	user@superposition.io	2024-08-22 12:05:34.969937	2024-08-22 12:05:34.969937	null
+Boolean	{"type": "boolean"}	user@superposition.io	2024-08-22 12:05:34.969937	2024-08-22 12:05:34.969937	null
+Enum	{"type": "string", "enum": ["android", "ios"]}	user@superposition.io	2024-08-22 12:05:34.969937	2024-08-22 12:05:34.969937	null
+Pattern	{"type": "string", "pattern": ".*"}	user@superposition.io	2024-08-22 12:05:34.969937	2024-08-22 12:05:34.969937	null
+URL	{"pattern":"https://.*","type":"string"}	user@superposition.io	2024-08-22 12:14:46.657825	2024-08-22 12:14:46.657825	user@superposition.io
 \.
 
 
@@ -4275,17 +5400,6 @@ COPY dev_experimentation.event_log_y2024m04 (id, table_name, user_name, "timesta
 --
 
 COPY dev_experimentation.event_log_y2024m05 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
-c37717e1-2e92-4116-9763-e2f7f2acbf55	experiments	postgres	2024-05-01 12:59:26.52675	INSERT	\N	{"id":7191420957775499264,"created_at":"2024-05-01T12:59:26.52598+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-01T12:59:26.525982+00:00","name":"testing foo increment","override_keys":["foo"],"status":"CREATED","traffic_percentage":0,"context":{"and":[]},"variants":[{"context_id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","id":"7191420957775499264-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","id":"7191420957775499264-experimental","override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","overrides":{"foo":14},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	INSERT INTO "experiments" ("id", "created_at", "created_by", "last_modified", "name", "override_keys", "status", "traffic_percentage", "context", "variants", "last_modified_by", "chosen_variant") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, DEFAULT) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-aa21af7f-126a-4bb4-9d0b-e14e9c21b69f	experiments	postgres	2024-05-01 13:00:18.033204	UPDATE	{"id":7191420957775499264,"created_at":"2024-05-01T12:59:26.52598+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-01T12:59:26.525982+00:00","name":"testing foo increment","override_keys":["foo"],"status":"CREATED","traffic_percentage":0,"context":{"and":[]},"variants":[{"context_id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","id":"7191420957775499264-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","id":"7191420957775499264-experimental","override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","overrides":{"foo":14},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	{"id":7191420957775499264,"created_at":"2024-05-01T12:59:26.52598+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-01T13:00:18.026442+00:00","name":"testing foo increment","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":0,"context":{"and":[]},"variants":[{"context_id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","id":"7191420957775499264-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","id":"7191420957775499264-experimental","override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","overrides":{"foo":14},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	UPDATE "experiments" SET "traffic_percentage" = $1, "last_modified" = $2, "last_modified_by" = $3, "status" = $4 WHERE ("experiments"."id" = $5) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-392bac24-3098-4cd5-972b-f72762677e51	experiments	postgres	2024-05-01 13:00:23.273963	UPDATE	{"id":7191420957775499264,"created_at":"2024-05-01T12:59:26.52598+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-01T13:00:18.026442+00:00","name":"testing foo increment","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":0,"context":{"and":[]},"variants":[{"context_id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","id":"7191420957775499264-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","id":"7191420957775499264-experimental","override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","overrides":{"foo":14},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	{"id":7191420957775499264,"created_at":"2024-05-01T12:59:26.52598+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-01T13:00:23.272822+00:00","name":"testing foo increment","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":12,"context":{"and":[]},"variants":[{"context_id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","id":"7191420957775499264-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","id":"7191420957775499264-experimental","override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","overrides":{"foo":14},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	UPDATE "experiments" SET "traffic_percentage" = $1, "last_modified" = $2, "last_modified_by" = $3, "status" = $4 WHERE ("experiments"."id" = $5) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-797e2c2c-314c-443e-90e5-9b80f25340ee	experiments	postgres	2024-05-02 04:13:27.491769	INSERT	\N	{"id":7191650977466945536,"created_at":"2024-05-02T04:13:27.489552+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:13:27.489553+00:00","name":"bangalore experiment","override_keys":["foo"],"status":"CREATED","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	INSERT INTO "experiments" ("id", "created_at", "created_by", "last_modified", "name", "override_keys", "status", "traffic_percentage", "context", "variants", "last_modified_by", "chosen_variant") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, DEFAULT) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-409f81fe-a577-48ab-a097-b51757aeb57f	experiments	postgres	2024-05-02 04:13:31.99882	UPDATE	{"id":7191650977466945536,"created_at":"2024-05-02T04:13:27.489552+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:13:27.489553+00:00","name":"bangalore experiment","override_keys":["foo"],"status":"CREATED","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	{"id":7191650977466945536,"created_at":"2024-05-02T04:13:27.489552+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:13:31.995893+00:00","name":"bangalore experiment","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	UPDATE "experiments" SET "traffic_percentage" = $1, "last_modified" = $2, "last_modified_by" = $3, "status" = $4 WHERE ("experiments"."id" = $5) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-2cc57cf5-6f46-4356-9f65-938f1a78b427	experiments	postgres	2024-05-02 04:13:45.956356	UPDATE	{"id":7191650977466945536,"created_at":"2024-05-02T04:13:27.489552+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:13:31.995893+00:00","name":"bangalore experiment","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	{"id":7191650977466945536,"created_at":"2024-05-02T04:13:27.489552+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:13:45.952817+00:00","name":"bangalore experiment","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":34,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	UPDATE "experiments" SET "traffic_percentage" = $1, "last_modified" = $2, "last_modified_by" = $3, "status" = $4 WHERE ("experiments"."id" = $5) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-6232259e-6b9c-45be-a06f-2945525e60cd	experiments	postgres	2024-05-02 04:13:53.829414	UPDATE	{"id":7191650977466945536,"created_at":"2024-05-02T04:13:27.489552+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:13:45.952817+00:00","name":"bangalore experiment","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":34,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	{"id":7191650977466945536,"created_at":"2024-05-02T04:13:27.489552+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:13:53.828349+00:00","name":"bangalore experiment","override_keys":["foo"],"status":"CONCLUDED","traffic_percentage":34,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":"7191650977466945536-experimental"}	UPDATE "experiments" SET "status" = $1, "last_modified" = $2, "last_modified_by" = $3, "chosen_variant" = $4 WHERE ("experiments"."id" = $5) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-191b8d64-a6cd-475d-84f0-6cc140741785	experiments	postgres	2024-05-02 04:15:15.404911	INSERT	\N	{"id":7191651430124621824,"created_at":"2024-05-02T04:15:15.403953+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:15:15.403956+00:00","name":"bangalore experiment 2","override_keys":["foo"],"status":"CREATED","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","id":"7191651430124621824-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","id":"7191651430124621824-experimental","override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","overrides":{"foo":18},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	INSERT INTO "experiments" ("id", "created_at", "created_by", "last_modified", "name", "override_keys", "status", "traffic_percentage", "context", "variants", "last_modified_by", "chosen_variant") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, DEFAULT) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-9ee8cb5e-a8c5-42b2-a178-07d112f4ba6b	experiments	postgres	2024-05-02 04:15:36.623989	UPDATE	{"id":7191651430124621824,"created_at":"2024-05-02T04:15:15.403953+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:15:15.403956+00:00","name":"bangalore experiment 2","override_keys":["foo"],"status":"CREATED","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","id":"7191651430124621824-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","id":"7191651430124621824-experimental","override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","overrides":{"foo":18},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	{"id":7191651430124621824,"created_at":"2024-05-02T04:15:15.403953+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:15:36.621412+00:00","name":"bangalore experiment 2","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","id":"7191651430124621824-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","id":"7191651430124621824-experimental","override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","overrides":{"foo":18},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	UPDATE "experiments" SET "traffic_percentage" = $1, "last_modified" = $2, "last_modified_by" = $3, "status" = $4 WHERE ("experiments"."id" = $5) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-e007bcc0-bb11-4dc0-a35c-00c620dee970	experiments	postgres	2024-05-02 04:15:39.353909	UPDATE	{"id":7191651430124621824,"created_at":"2024-05-02T04:15:15.403953+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:15:36.621412+00:00","name":"bangalore experiment 2","override_keys":["foo"],"status":"INPROGRESS","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","id":"7191651430124621824-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","id":"7191651430124621824-experimental","override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","overrides":{"foo":18},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	{"id":7191651430124621824,"created_at":"2024-05-02T04:15:15.403953+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T04:15:39.351579+00:00","name":"bangalore experiment 2","override_keys":["foo"],"status":"CONCLUDED","traffic_percentage":0,"context":{"":[{"var":"city"},"Bangalore"]},"variants":[{"context_id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","id":"7191651430124621824-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","id":"7191651430124621824-experimental","override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","overrides":{"foo":18},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":"7191651430124621824-experimental"}	UPDATE "experiments" SET "status" = $1, "last_modified" = $2, "last_modified_by" = $3, "chosen_variant" = $4 WHERE ("experiments"."id" = $5) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
-9601ff8b-9b66-4c1e-8072-433c4efeb0e6	experiments	postgres	2024-05-02 07:23:51.433091	INSERT	\N	{"id":7191698892931600384,"created_at":"2024-05-02T07:23:51.432422+00:00","created_by":"superposition@juspay.in","last_modified":"2024-05-02T07:23:51.432424+00:00","name":"default operator check","override_keys":["foo"],"status":"CREATED","traffic_percentage":0,"context":{"":[{"var":"city"},"FooBar"]},"variants":[{"context_id":"5bf54e4783b83f91b2ae1e1d905a2897b007a657bc235475c3881b0f06b6f7a2","id":"7191698892931600384-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"81b9cf1f4ae22d89f5d3118d1019698abe46cfe481ca3593d61f2acc04bc498c","id":"7191698892931600384-experimental","override_id":"16d291cd4d3204baecba99cd4e9b4a7978719df8265774f13679db03b17c0698","overrides":{"foo":43},"variant_type":"EXPERIMENTAL"}],"last_modified_by":"superposition@juspay.in","chosen_variant":null}	INSERT INTO "experiments" ("id", "created_at", "created_by", "last_modified", "name", "override_keys", "status", "traffic_percentage", "context", "variants", "last_modified_by", "chosen_variant") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, DEFAULT) RETURNING "experiments"."id", "experiments"."created_at", "experiments"."created_by", "experiments"."last_modified", "experiments"."name", "experiments"."override_keys", "experiments"."status", "experiments"."traffic_percentage", "experiments"."context", "experiments"."variants", "experiments"."last_modified_by", "experiments"."chosen_variant"
 \.
 
 
@@ -4542,10 +5656,473 @@ COPY dev_experimentation.event_log_y2026m12 (id, table_name, user_name, "timesta
 --
 
 COPY dev_experimentation.experiments (id, created_at, created_by, last_modified, name, override_keys, status, traffic_percentage, context, variants, last_modified_by, chosen_variant) FROM stdin;
-7191420957775499264	2024-05-01 12:59:26.52598+00	superposition@juspay.in	2024-05-01 13:00:23.272822+00	testing foo increment	{foo}	INPROGRESS	12	{"and":[]}	[{"context_id":"fb6c3f081a7d44d73f603c3c1e6ea2b4f6c823c33316aa2629a3864d68d98b66","id":"7191420957775499264-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"1e4087f940e168cafcff6e2a693eab9ad5ffba71b98d2463af04a9be3ab8fc9a","id":"7191420957775499264-experimental","override_id":"bbbea2aa79b2e69bbe6905fa9045f29ad4205621b5b4adf16c7e26d01a5a318e","overrides":{"foo":14},"variant_type":"EXPERIMENTAL"}]	superposition@juspay.in	\N
-7191650977466945536	2024-05-02 04:13:27.489552+00	superposition@juspay.in	2024-05-02 04:13:53.828349+00	bangalore experiment	{foo}	CONCLUDED	34	{"":[{"var":"city"},"Bangalore"]}	[{"context_id":"89c076836990b7b9fbe6386b513712e0532516242165d04b8a286b7fcd6e637c","id":"7191650977466945536-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"00ab50b29e06b77448320034a82bfbb411ad014bbc8bef5835347320e7e1427a","id":"7191650977466945536-experimental","override_id":"655941b5b4116a70e7ab0fdc4fb38d8d2479ade758f605b79347ff60e31f22cb","overrides":{"foo":17},"variant_type":"EXPERIMENTAL"}]	superposition@juspay.in	7191650977466945536-experimental
-7191651430124621824	2024-05-02 04:15:15.403953+00	superposition@juspay.in	2024-05-02 04:15:39.351579+00	bangalore experiment 2	{foo}	CONCLUDED	0	{"":[{"var":"city"},"Bangalore"]}	[{"context_id":"3162da98fc4912c835341a77c1fc72cfb491a61832662e0493510e28ac3bb3fb","id":"7191651430124621824-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"525064795060ba63a14b63dcb0b7ecfa55001c490b9d8cff53eb8fc636c030be","id":"7191651430124621824-experimental","override_id":"b5be3e559306b2f3ecada2fd438bdd42e8ed9104576f25ebe66a88d007d38772","overrides":{"foo":18},"variant_type":"EXPERIMENTAL"}]	superposition@juspay.in	7191651430124621824-experimental
-7191698892931600384	2024-05-02 07:23:51.432422+00	superposition@juspay.in	2024-05-02 07:23:51.432424+00	default operator check	{foo}	CREATED	0	{"":[{"var":"city"},"FooBar"]}	[{"context_id":"5bf54e4783b83f91b2ae1e1d905a2897b007a657bc235475c3881b0f06b6f7a2","id":"7191698892931600384-control","override_id":"4045fc51982e1424d81e02e3e78c68e7a91a3b2077a27beefb443edd05deba78","overrides":{"foo":10},"variant_type":"CONTROL"},{"context_id":"81b9cf1f4ae22d89f5d3118d1019698abe46cfe481ca3593d61f2acc04bc498c","id":"7191698892931600384-experimental","override_id":"16d291cd4d3204baecba99cd4e9b4a7978719df8265774f13679db03b17c0698","overrides":{"foo":43},"variant_type":"EXPERIMENTAL"}]	superposition@juspay.in	\N
+\.
+
+
+--
+-- Data for Name: __diesel_schema_migrations; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.__diesel_schema_migrations (version, run_on) FROM stdin;
+00000000000000	2024-08-22 10:49:57.89682
+20231016133815	2024-08-22 10:49:57.901301
+20240123123559	2024-08-22 10:49:57.991129
+20240219125126	2024-08-22 10:49:58.16889
+20240305122806	2024-08-22 10:49:58.173486
+20240422122806	2024-08-22 10:49:58.177093
+20240506133756	2024-08-22 10:49:58.182094
+20240731065515	2024-08-22 10:49:58.189142
+20231016134612	2024-08-22 10:49:58.324097
+20240118063937	2024-08-22 10:49:58.334082
+\.
+
+
+--
+-- Data for Name: config_versions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.config_versions (id, config, config_hash, tags, created_at) FROM stdin;
+7232338676053839872	{"contexts":[],"default_configs":{"base_rate":10.0},"overrides":{}}	a3a50ef5b9a9367bdd48fa4003b5f07686bcf67833085403c5fff5f93b82eba1	\N	2024-08-22 10:51:50.731042
+7232338782970843136	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR"},"overrides":{}}	dc10e297ed72652a199e8ca90d460baa61889f171d8e8d9d738d336dafa312f8	\N	2024-08-22 10:52:16.222832
+7232338902726610944	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","per_distance_unit_rate":15.0},"overrides":{}}	ac9e3d933a912bb368f807dce0f9b2eda1d0d04de45e2f65eaada0b7f73f3618	\N	2024-08-22 10:52:44.771626
+7232338993331965952	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","per_distance_unit_rate":15.0},"overrides":{}}	53f07c85de4c1f0ca36dea05f777b371e5bd781c4f8f91f5413a73537a0f74e9	\N	2024-08-22 10:53:06.372277
+7232339178661482496	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","per_distance_unit_rate":15.0},"overrides":{}}	00ab9929de0a52f9c63af36086397b0314df3e044b97540570d92aa0cefec95d	\N	2024-08-22 10:53:50.559477
+7232339269442998272	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","per_distance_unit_rate":15.0},"overrides":{}}	61031b938a053d3a6a9834cd97a5a3d90e3e1bdcf581d940585bb6d555d15d0f	\N	2024-08-22 10:54:12.202808
+7232339361629605888	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{}}	0179e598de97d0861be8eab2cbbe8b1db68991a431e80f0f8bb27571ba8f6cd8	\N	2024-08-22 10:54:34.181901
+7232342504790691840	{"contexts":[],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{}}	0179e598de97d0861be8eab2cbbe8b1db68991a431e80f0f8bb27571ba8f6cd8	\N	2024-08-22 11:07:03.571585
+7232343389096775680	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153"],"priority":4}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}}}	ef1a4c8bfe83cbd9c1a32336985d99c601640990db677261627cb5f54fd05245	\N	2024-08-22 11:10:34.4086
+7232344922727256064	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153"],"priority":4},{"condition":{"==":[{"var":"city"},"Chennai"]},"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","override_with_keys":["645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b"],"priority":4}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}}}	2d93211fd3e1721dfb63c0faf9decd730e87f427f6540b80ce32e0d7e69beb4e	\N	2024-08-22 11:16:40.056076
+7232345263912914944	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153"],"priority":4},{"condition":{"==":[{"var":"city"},"Chennai"]},"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","override_with_keys":["645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b"],"priority":4},{"condition":{"==":[{"var":"city"},"Seattle"]},"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","override_with_keys":["f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69"],"priority":4}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}}}	3648f3a2e4c0cb6aaf549a7aefb769d42e630688f70bd84412779ffc1552b889	\N	2024-08-22 11:18:01.39626
+7232345353880735744	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153"],"priority":4},{"condition":{"==":[{"var":"city"},"Chennai"]},"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","override_with_keys":["645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b"],"priority":4},{"condition":{"==":[{"var":"city"},"Seattle"]},"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","override_with_keys":["f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69"],"priority":4},{"condition":{"and":[{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"city"},"Bangalore"]}]},"id":"9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc","override_with_keys":["e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede"],"priority":6}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede":{"base_rate":12},"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}}}	6c523b7b2ccc302052f58f27d5981ad8159aa68b4b64b6c02eb192e7a6ae73bc	\N	2024-08-22 11:18:22.84735
+7232345556251709440	{"contexts":[{"condition":{"==":[{"var":"city"},"Bangalore"]},"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","override_with_keys":["932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153"],"priority":4},{"condition":{"==":[{"var":"city"},"Chennai"]},"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","override_with_keys":["645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b"],"priority":4},{"condition":{"==":[{"var":"city"},"Seattle"]},"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","override_with_keys":["f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69"],"priority":4},{"condition":{"and":[{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"city"},"Bangalore"]}]},"id":"9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc","override_with_keys":["e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede"],"priority":6},{"condition":{"and":[{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"hour_of_day"},9]}]},"id":"d8256cd0c9fbbfae460057ed14f0630f4dd0b050cf271832b0c9bfb5e31ca43b","override_with_keys":["204dc317acb302d38289cbfbc3227461d45bdde8dc5bfc0f6f961a8bb476e910"],"priority":38}],"default_configs":{"base_rate":10.0,"currency":"INR","distance_unit":"Km","hello_message":"Hello World !!!","hello_message_color":"black","logo":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","per_distance_unit_rate":15.0},"overrides":{"204dc317acb302d38289cbfbc3227461d45bdde8dc5bfc0f6f961a8bb476e910":{"base_rate":100,"per_distance_unit_rate":50},"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede":{"base_rate":12},"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}}}	3f6a59b118bad407826069253484d3f5cf09fbbe17b5a2122620b1d6a3401a35	\N	2024-08-22 11:19:11.095851
+\.
+
+
+--
+-- Data for Name: contexts; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.contexts (id, value, override_id, created_at, created_by, priority, override, last_modified_at, last_modified_by) FROM stdin;
+11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4	{"==":[{"var":"city"},"Bangalore"]}	932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153	2024-08-22 11:10:34.385255+00	user@superposition.io	4	{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15}	2024-08-22 11:10:34.385262	user@superposition.io
+e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8	{"==":[{"var":"city"},"Chennai"]}	645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b	2024-08-22 11:16:40.025706+00	user@superposition.io	4	{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"}	2024-08-22 11:16:40.025709	user@superposition.io
+3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35	{"==":[{"var":"city"},"Seattle"]}	f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69	2024-08-22 11:18:01.390332+00	user@superposition.io	4	{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5}	2024-08-22 11:18:01.390335	user@superposition.io
+9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc	{"and":[{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"city"},"Bangalore"]}]}	e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede	2024-08-22 11:18:22.838349+00	user@superposition.io	6	{"base_rate":12}	2024-08-22 11:18:22.838376	user@superposition.io
+d8256cd0c9fbbfae460057ed14f0630f4dd0b050cf271832b0c9bfb5e31ca43b	{"and":[{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"hour_of_day"},9]}]}	204dc317acb302d38289cbfbc3227461d45bdde8dc5bfc0f6f961a8bb476e910	2024-08-22 11:19:11.08507+00	user@superposition.io	38	{"base_rate":100,"per_distance_unit_rate":50}	2024-08-22 11:19:11.085073	user@superposition.io
+\.
+
+
+--
+-- Data for Name: default_configs; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.default_configs (key, value, created_at, created_by, schema, function_name, last_modified_at, last_modified_by) FROM stdin;
+base_rate	10.0	2024-08-22 10:51:50.704636+00	user@superposition.io	{"type":"number"}	\N	2024-08-22 10:51:50.704963	user@superposition.io
+currency	"INR"	2024-08-22 10:52:16.209834+00	user@superposition.io	{"enum":["INR","USD","EUR"],"type":"string"}	\N	2024-08-22 10:52:16.209844	user@superposition.io
+per_distance_unit_rate	15.0	2024-08-22 10:52:44.764395+00	user@superposition.io	{"type":"number"}	\N	2024-08-22 10:52:44.76441	user@superposition.io
+distance_unit	"Km"	2024-08-22 10:53:06.368909+00	user@superposition.io	{"enum":["Km","Miles"],"type":"string"}	\N	2024-08-22 10:53:06.368914	user@superposition.io
+hello_message	"Hello World !!!"	2024-08-22 10:53:50.551716+00	user@superposition.io	{"pattern":".*","type":"string"}	\N	2024-08-22 10:53:50.55172	user@superposition.io
+hello_message_color	"black"	2024-08-22 10:54:12.197449+00	user@superposition.io	{"enum":["black","red","blue","green","pink"],"type":"string"}	\N	2024-08-22 10:54:12.197459	user@superposition.io
+logo	"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg"	2024-08-22 10:54:34.169556+00	user@superposition.io	{"pattern":"https://.*","type":"string"}	axios_validator_example	2024-08-22 11:07:03.007146	user@superposition.io
+\.
+
+
+--
+-- Data for Name: dimensions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.dimensions (dimension, priority, created_at, created_by, schema, function_name, last_modified_at, last_modified_by) FROM stdin;
+variantIds	1	2024-08-22 10:55:19.609194+00	user@superposition.io	{"pattern":".*","type":"string"}	\N	2024-08-22 10:55:19.609202	user@superposition.io
+vehicle_type	2	2024-08-22 10:55:54.394804+00	user@superposition.io	{"enum":["cab","auto"],"type":"string"}	\N	2024-08-22 10:55:54.394812	user@superposition.io
+city	4	2024-08-22 10:56:13.771152+00	user@superposition.io	{"pattern":"[a-zA-Z ]+","type":"string"}	\N	2024-08-22 10:56:13.771157	user@superposition.io
+hour_of_day	32	2024-08-22 10:56:31.492196+00	user@superposition.io	{"type":"integer"}	\N	2024-08-22 10:56:31.492201	user@superposition.io
+\.
+
+
+--
+-- Data for Name: event_log_y2023m08; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2023m08 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2023m09; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2023m09 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2023m10; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2023m10 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2023m11; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2023m11 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2023m12; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2023m12 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m01; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m01 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m02; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m02 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m03; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m03 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m04; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m04 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m05; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m05 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m06; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m06 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m07; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m07 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m08; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m08 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+61a05923-ee36-42b5-8bba-97f5ad514c6e	default_configs	postgres	2024-08-22 10:51:50.698077	INSERT	\N	{"key":"base_rate","value":10.0,"created_at":"2024-08-22T10:51:50.704636+00:00","created_by":"user@superposition.io","schema":{"type":"number"},"function_name":null,"last_modified_at":"2024-08-22T10:51:50.704963","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+8c004912-e875-4a18-8179-1309f63f804a	default_configs	postgres	2024-08-22 10:52:16.209675	INSERT	\N	{"key":"currency","value":"INR","created_at":"2024-08-22T10:52:16.209834+00:00","created_by":"user@superposition.io","schema":{"enum":["INR","USD","EUR"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:52:16.209844","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+ad9b4fb1-2d62-49ec-8422-9cec504b15e7	default_configs	postgres	2024-08-22 10:52:44.764932	INSERT	\N	{"key":"per_distance_unit_rate","value":15.0,"created_at":"2024-08-22T10:52:44.764395+00:00","created_by":"user@superposition.io","schema":{"type":"number"},"function_name":null,"last_modified_at":"2024-08-22T10:52:44.76441","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+2773fe75-3992-49f4-b332-7d2298916c05	default_configs	postgres	2024-08-22 10:53:06.367024	INSERT	\N	{"key":"distance_unit","value":"Km","created_at":"2024-08-22T10:53:06.368909+00:00","created_by":"user@superposition.io","schema":{"enum":["Km","Miles"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:53:06.368914","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+c2a2b240-26ab-4aaa-b78f-018e53a8f6b4	default_configs	postgres	2024-08-22 10:53:50.555561	INSERT	\N	{"key":"hello_message","value":"Hello World !!!","created_at":"2024-08-22T10:53:50.551716+00:00","created_by":"user@superposition.io","schema":{"pattern":".*","type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:53:50.55172","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+30823c39-5c2b-4e35-9cfd-970c7b758007	default_configs	postgres	2024-08-22 10:54:12.198189	INSERT	\N	{"key":"hello_message_color","value":"black","created_at":"2024-08-22T10:54:12.197449+00:00","created_by":"user@superposition.io","schema":{"enum":["black","red","blue","green","pink"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:54:12.197459","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+d0551c40-d8b5-4863-bb0f-0ef20cc984d5	default_configs	postgres	2024-08-22 10:54:34.173895	INSERT	\N	{"key":"logo","value":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","created_at":"2024-08-22T10:54:34.169556+00:00","created_by":"user@superposition.io","schema":{"pattern":"https://.*","type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:54:34.169566","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("key") DO UPDATE SET "value" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14
+68042015-8fb5-43ac-a7d3-f813cdd6adf6	dimensions	postgres	2024-08-22 10:55:19.612784	INSERT	\N	{"dimension":"variantIds","priority":1,"created_at":"2024-08-22T10:55:19.609194+00:00","created_by":"user@superposition.io","schema":{"pattern":".*","type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:55:19.609202","last_modified_by":"user@superposition.io"}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name", "dimensions"."last_modified_at", "dimensions"."last_modified_by"
+c3135370-3f05-4538-9b03-04fec8ac6b07	dimensions	postgres	2024-08-22 10:55:54.399114	INSERT	\N	{"dimension":"vehicle_type","priority":2,"created_at":"2024-08-22T10:55:54.394804+00:00","created_by":"user@superposition.io","schema":{"enum":["cab","auto"],"type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:55:54.394812","last_modified_by":"user@superposition.io"}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name", "dimensions"."last_modified_at", "dimensions"."last_modified_by"
+885a7d17-b271-4b27-b2e3-28db0c9edc81	dimensions	postgres	2024-08-22 10:56:13.774001	INSERT	\N	{"dimension":"city","priority":4,"created_at":"2024-08-22T10:56:13.771152+00:00","created_by":"user@superposition.io","schema":{"pattern":"[a-zA-Z ]+","type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:56:13.771157","last_modified_by":"user@superposition.io"}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name", "dimensions"."last_modified_at", "dimensions"."last_modified_by"
+9afcf5f8-3b73-4e05-a95a-7826a5fcfc7b	dimensions	postgres	2024-08-22 10:56:31.495544	INSERT	\N	{"dimension":"hour_of_day","priority":32,"created_at":"2024-08-22T10:56:31.492196+00:00","created_by":"user@superposition.io","schema":{"type":"integer"},"function_name":null,"last_modified_at":"2024-08-22T10:56:31.492201","last_modified_by":"user@superposition.io"}	INSERT INTO "dimensions" ("dimension", "priority", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, DEFAULT, $6, $7) ON CONFLICT ("dimension") DO UPDATE SET "priority" = $8, "created_at" = $9, "created_by" = $10, "schema" = $11, "function_name" = $12, "last_modified_at" = $13, "last_modified_by" = $14 RETURNING "dimensions"."dimension", "dimensions"."priority", "dimensions"."created_at", "dimensions"."created_by", "dimensions"."schema", "dimensions"."function_name", "dimensions"."last_modified_at", "dimensions"."last_modified_by"
+f3ac701d-20ec-4e10-83e9-3766935f9ec9	functions	postgres	2024-08-22 11:00:45.891024	INSERT	\N	{"function_name":"axios_validator_example","published_code":null,"draft_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","function_description":"A function that validates URLs using axios","published_runtime_version":null,"draft_runtime_version":"1.0.0","published_at":null,"draft_edited_at":"2024-08-22T11:00:45.887906","published_by":null,"draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T11:00:45.887909","last_modified_by":"user@superposition.io"}	INSERT INTO "functions" ("function_name", "published_code", "draft_code", "function_description", "published_runtime_version", "draft_runtime_version", "published_at", "draft_edited_at", "published_by", "draft_edited_by", "last_modified_at", "last_modified_by") VALUES ($1, DEFAULT, $2, $3, DEFAULT, $4, DEFAULT, $5, DEFAULT, $6, $7, $8) RETURNING "functions"."function_name", "functions"."published_code", "functions"."draft_code", "functions"."function_description", "functions"."published_runtime_version", "functions"."draft_runtime_version", "functions"."published_at", "functions"."draft_edited_at", "functions"."published_by", "functions"."draft_edited_by", "functions"."last_modified_at", "functions"."last_modified_by"
+6c6d9102-8154-4aff-9187-00569443bdd1	functions	postgres	2024-08-22 11:00:54.686902	UPDATE	{"function_name":"axios_validator_example","published_code":null,"draft_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","function_description":"A function that validates URLs using axios","published_runtime_version":null,"draft_runtime_version":"1.0.0","published_at":null,"draft_edited_at":"2024-08-22T11:00:45.887906","published_by":null,"draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T11:00:45.887909","last_modified_by":"user@superposition.io"}	{"function_name":"axios_validator_example","published_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","draft_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","function_description":"A function that validates URLs using axios","published_runtime_version":"1.0.0","draft_runtime_version":"1.0.0","published_at":"2024-08-22T11:00:54.684656","draft_edited_at":"2024-08-22T11:00:45.887906","published_by":"user@superposition.io","draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T11:00:45.887909","last_modified_by":"user@superposition.io"}	UPDATE "functions" SET "published_code" = $1, "published_runtime_version" = $2, "published_by" = $3, "published_at" = $4 WHERE ("functions"."function_name" = $5) RETURNING "functions"."function_name", "functions"."published_code", "functions"."draft_code", "functions"."function_description", "functions"."published_runtime_version", "functions"."draft_runtime_version", "functions"."published_at", "functions"."draft_edited_at", "functions"."published_by", "functions"."draft_edited_by", "functions"."last_modified_at", "functions"."last_modified_by"
+794319fd-2975-4c11-9e17-985312faaed8	functions	postgres	2024-08-22 11:02:07.804337	UPDATE	{"function_name":"axios_validator_example","published_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","draft_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","function_description":"A function that validates URLs using axios","published_runtime_version":"1.0.0","draft_runtime_version":"1.0.0","published_at":"2024-08-22T11:00:54.684656","draft_edited_at":"2024-08-22T11:00:45.887906","published_by":"user@superposition.io","draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T11:00:45.887909","last_modified_by":"user@superposition.io"}	{"function_name":"axios_validator_example","published_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","draft_code":"Ly8gVGhpcyBmdW5jdGlvbiBzaG91bGQgcmV0dXJuIGEgYm9vbGVhbiwgdHJ1ZSBmb3Igc3VjY2Vzc2Z1bCB2YWxpZGF0aW9uIGFuZCBmYWxzZSBpZiBub3QuIElmIHRoZSB2YWxpZGF0ZSBmdW5jdGlvbiByZXR1cm5zIGZhbHNlLAovLyBTdXBlcnBvc2l0aW9uIHdpbGwgbm90IGFsbG93IHRoZSBpdGVtIHRvIGJlIHNhdmVkCgphc3luYyBmdW5jdGlvbiB2YWxpZGF0ZShrZXksIHZhbHVlKSB7CiAgICByZXR1cm4gYXhpb3MuZ2V0KHZhbHVlKS50aGVuKHJlc3BvbnNlID0+IHJlc3BvbnNlLnN0YXR1cyA9PSAnMjAwJykKICAgIC5jYXRjaChlcnIgPT4gewogICAgICAgIGNvbnNvbGUubG9nKGVycik7CiAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgfSk7Cn0K","function_description":"A function that validates URLs using axios","published_runtime_version":"1.0.0","draft_runtime_version":"1.0.0","published_at":"2024-08-22T11:00:54.684656","draft_edited_at":"2024-08-22T11:02:07.801713","published_by":"user@superposition.io","draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T11:02:07.801715","last_modified_by":"user@superposition.io"}	UPDATE "functions" SET "function_name" = $1, "published_code" = $2, "draft_code" = $3, "function_description" = $4, "published_runtime_version" = $5, "draft_runtime_version" = $6, "published_at" = $7, "draft_edited_at" = $8, "published_by" = $9, "draft_edited_by" = $10, "last_modified_at" = $11, "last_modified_by" = $12 WHERE ("functions"."function_name" = $13) RETURNING "functions"."function_name", "functions"."published_code", "functions"."draft_code", "functions"."function_description", "functions"."published_runtime_version", "functions"."draft_runtime_version", "functions"."published_at", "functions"."draft_edited_at", "functions"."published_by", "functions"."draft_edited_by", "functions"."last_modified_at", "functions"."last_modified_by"
+e8ca2138-fb5d-4846-8071-68cffd38c6aa	functions	postgres	2024-08-22 11:02:09.422562	UPDATE	{"function_name":"axios_validator_example","published_code":"YXN5bmMgZnVuY3Rpb24gdmFsaWRhdGUoa2V5LCB2YWx1ZSkgewogICAgcmV0dXJuIGF4aW9zLmdldCh2YWx1ZSkudGhlbihyZXNwb25zZSA9PiByZXNwb25zZS5zdGF0dXMgPT0gJzIwMCcpCiAgICAuY2F0Y2goZXJyID0+IHsKICAgICAgICBjb25zb2xlLmxvZyhlcnIpOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0pOwp9Cg==","draft_code":"Ly8gVGhpcyBmdW5jdGlvbiBzaG91bGQgcmV0dXJuIGEgYm9vbGVhbiwgdHJ1ZSBmb3Igc3VjY2Vzc2Z1bCB2YWxpZGF0aW9uIGFuZCBmYWxzZSBpZiBub3QuIElmIHRoZSB2YWxpZGF0ZSBmdW5jdGlvbiByZXR1cm5zIGZhbHNlLAovLyBTdXBlcnBvc2l0aW9uIHdpbGwgbm90IGFsbG93IHRoZSBpdGVtIHRvIGJlIHNhdmVkCgphc3luYyBmdW5jdGlvbiB2YWxpZGF0ZShrZXksIHZhbHVlKSB7CiAgICByZXR1cm4gYXhpb3MuZ2V0KHZhbHVlKS50aGVuKHJlc3BvbnNlID0+IHJlc3BvbnNlLnN0YXR1cyA9PSAnMjAwJykKICAgIC5jYXRjaChlcnIgPT4gewogICAgICAgIGNvbnNvbGUubG9nKGVycik7CiAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgfSk7Cn0K","function_description":"A function that validates URLs using axios","published_runtime_version":"1.0.0","draft_runtime_version":"1.0.0","published_at":"2024-08-22T11:00:54.684656","draft_edited_at":"2024-08-22T11:02:07.801713","published_by":"user@superposition.io","draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T11:02:07.801715","last_modified_by":"user@superposition.io"}	{"function_name":"axios_validator_example","published_code":"Ly8gVGhpcyBmdW5jdGlvbiBzaG91bGQgcmV0dXJuIGEgYm9vbGVhbiwgdHJ1ZSBmb3Igc3VjY2Vzc2Z1bCB2YWxpZGF0aW9uIGFuZCBmYWxzZSBpZiBub3QuIElmIHRoZSB2YWxpZGF0ZSBmdW5jdGlvbiByZXR1cm5zIGZhbHNlLAovLyBTdXBlcnBvc2l0aW9uIHdpbGwgbm90IGFsbG93IHRoZSBpdGVtIHRvIGJlIHNhdmVkCgphc3luYyBmdW5jdGlvbiB2YWxpZGF0ZShrZXksIHZhbHVlKSB7CiAgICByZXR1cm4gYXhpb3MuZ2V0KHZhbHVlKS50aGVuKHJlc3BvbnNlID0+IHJlc3BvbnNlLnN0YXR1cyA9PSAnMjAwJykKICAgIC5jYXRjaChlcnIgPT4gewogICAgICAgIGNvbnNvbGUubG9nKGVycik7CiAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgfSk7Cn0K","draft_code":"Ly8gVGhpcyBmdW5jdGlvbiBzaG91bGQgcmV0dXJuIGEgYm9vbGVhbiwgdHJ1ZSBmb3Igc3VjY2Vzc2Z1bCB2YWxpZGF0aW9uIGFuZCBmYWxzZSBpZiBub3QuIElmIHRoZSB2YWxpZGF0ZSBmdW5jdGlvbiByZXR1cm5zIGZhbHNlLAovLyBTdXBlcnBvc2l0aW9uIHdpbGwgbm90IGFsbG93IHRoZSBpdGVtIHRvIGJlIHNhdmVkCgphc3luYyBmdW5jdGlvbiB2YWxpZGF0ZShrZXksIHZhbHVlKSB7CiAgICByZXR1cm4gYXhpb3MuZ2V0KHZhbHVlKS50aGVuKHJlc3BvbnNlID0+IHJlc3BvbnNlLnN0YXR1cyA9PSAnMjAwJykKICAgIC5jYXRjaChlcnIgPT4gewogICAgICAgIGNvbnNvbGUubG9nKGVycik7CiAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgfSk7Cn0K","function_description":"A function that validates URLs using axios","published_runtime_version":"1.0.0","draft_runtime_version":"1.0.0","published_at":"2024-08-22T11:02:09.420582","draft_edited_at":"2024-08-22T11:02:07.801713","published_by":"user@superposition.io","draft_edited_by":"user@superposition.io","last_modified_at":"2024-08-22T11:02:07.801715","last_modified_by":"user@superposition.io"}	UPDATE "functions" SET "published_code" = $1, "published_runtime_version" = $2, "published_by" = $3, "published_at" = $4 WHERE ("functions"."function_name" = $5) RETURNING "functions"."function_name", "functions"."published_code", "functions"."draft_code", "functions"."function_description", "functions"."published_runtime_version", "functions"."draft_runtime_version", "functions"."published_at", "functions"."draft_edited_at", "functions"."published_by", "functions"."draft_edited_by", "functions"."last_modified_at", "functions"."last_modified_by"
+a2b79f81-1508-49e1-abbc-c4d0bb1c86b9	default_configs	postgres	2024-08-22 11:07:03.550305	UPDATE	{"key":"logo","value":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","created_at":"2024-08-22T10:54:34.169556+00:00","created_by":"user@superposition.io","schema":{"pattern":"https://.*","type":"string"},"function_name":null,"last_modified_at":"2024-08-22T10:54:34.169566","last_modified_by":"user@superposition.io"}	{"key":"logo","value":"https://cdn1.vectorstock.com/i/1000x1000/03/20/big-city-logo-vector-20480320.jpg","created_at":"2024-08-22T10:54:34.169556+00:00","created_by":"user@superposition.io","schema":{"pattern":"https://.*","type":"string"},"function_name":"axios_validator_example","last_modified_at":"2024-08-22T11:07:03.007146","last_modified_by":"user@superposition.io"}	INSERT INTO "default_configs" ("key", "value", "created_at", "created_by", "schema", "function_name", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT ("key") DO UPDATE SET "value" = $9, "created_at" = $10, "created_by" = $11, "schema" = $12, "function_name" = $13, "last_modified_at" = $14, "last_modified_by" = $15
+c3fc7b7e-7eb2-4d21-a986-b0b6f78d0978	contexts	postgres	2024-08-22 11:10:33.64684	INSERT	\N	{"id":"11c6bd932b8888a9e50be8f822b76116fbaa20fd58b059f98b9e7179543bb9a4","value":{"==":[{"var":"city"},"Bangalore"]},"override_id":"932a2b3502038c2e975d9ace00c90f016860ecb14564cf13085b0d40d1959153","created_at":"2024-08-22T11:10:34.385255+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":20,"currency":"INR","distance_unit":"Km","hello_message":"ನಮಸ್ಕಾರ ಬೆಂಗಳೂರು","hello_message_color":"red","logo":"https://www.shutterstock.com/image-vector/bangalore-logo-vidhana-soudha-600nw-1506258893.jpg","per_distance_unit_rate":15},"last_modified_at":"2024-08-22T11:10:34.385262","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+75a8dd6b-27c3-4369-be40-845a46ed3312	contexts	postgres	2024-08-22 11:16:39.214364	INSERT	\N	{"id":"e47edbe36bf3333f42ca2ded0a4604997adc4f6e0bf6176079272597c01353d8","value":{"==":[{"var":"city"},"Chennai"]},"override_id":"645b12a924823be87eb423791f3c42393ab19103afcd8ce923c4a1112408b32b","created_at":"2024-08-22T11:16:40.025706+00:00","created_by":"user@superposition.io","priority":4,"override":{"hello_message":"வணக்கம் சென்னை","hello_message_color":"green","logo":"https://www.shutterstock.com/image-vector/chennai-skyline-color-landmarks-blue-260nw-515862346.jpg"},"last_modified_at":"2024-08-22T11:16:40.025709","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+a411e43b-8503-46a3-89b7-17ad007f5fd5	contexts	postgres	2024-08-22 11:18:00.655318	INSERT	\N	{"id":"3f0e5fe95e2e758151d4cef712185767a137c926a9e7156b6face3a98b167d35","value":{"==":[{"var":"city"},"Seattle"]},"override_id":"f73412831793a34df7df95a79bc65754b1eebf31534e4ccfa9c79681fcf8ac69","created_at":"2024-08-22T11:18:01.390332+00:00","created_by":"user@superposition.io","priority":4,"override":{"base_rate":5,"currency":"USD","distance_unit":"Miles","hello_message":"Hello Seattle","hello_message_color":"blue","logo":"https://t4.ftcdn.net/jpg/04/24/15/07/360_F_424150716_kDZIgUONDIKpIhHqsxlDcVIiglyjIOQs.jpg","per_distance_unit_rate":2.5},"last_modified_at":"2024-08-22T11:18:01.390335","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+05c675b3-434d-4222-815a-8fcaa5376d32	contexts	postgres	2024-08-22 11:18:22.825149	INSERT	\N	{"id":"9fb61ecfb662467e9036ec79bfd8c02ac244c1836f113242aec5fe6d9265d8dc","value":{"and":[{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"city"},"Bangalore"]}]},"override_id":"e2411e811b927824f910f9edd75b984a3ad226c46a1216ffa735b7bda60c1ede","created_at":"2024-08-22T11:18:22.838349+00:00","created_by":"user@superposition.io","priority":6,"override":{"base_rate":12},"last_modified_at":"2024-08-22T11:18:22.838376","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+378960f7-0f5b-4de9-b8ee-e9412640edb3	contexts	postgres	2024-08-22 11:19:11.070187	INSERT	\N	{"id":"d8256cd0c9fbbfae460057ed14f0630f4dd0b050cf271832b0c9bfb5e31ca43b","value":{"and":[{"==":[{"var":"vehicle_type"},"cab"]},{"==":[{"var":"city"},"Bangalore"]},{"==":[{"var":"hour_of_day"},9]}]},"override_id":"204dc317acb302d38289cbfbc3227461d45bdde8dc5bfc0f6f961a8bb476e910","created_at":"2024-08-22T11:19:11.08507+00:00","created_by":"user@superposition.io","priority":38,"override":{"base_rate":100,"per_distance_unit_rate":50},"last_modified_at":"2024-08-22T11:19:11.085073","last_modified_by":"user@superposition.io"}	INSERT INTO "contexts" ("id", "value", "override_id", "created_at", "created_by", "priority", "override", "last_modified_at", "last_modified_by") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+\.
+
+
+--
+-- Data for Name: event_log_y2024m09; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m09 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m10; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m10 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m11; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m11 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2024m12; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2024m12 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m01; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m01 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m02; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m02 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m03; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m03 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m04; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m04 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m05; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m05 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m06; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m06 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m07; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m07 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m08; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m08 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m09; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m09 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m10; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m10 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m11; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m11 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2025m12; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2025m12 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m01; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m01 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m02; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m02 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m03; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m03 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m04; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m04 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m05; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m05 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m06; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m06 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m07; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m07 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m08; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m08 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m09; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m09 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m10; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m10 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m11; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m11 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log_y2026m12; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.event_log_y2026m12 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+\.
+
+
+--
+-- Data for Name: experiments; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.experiments (id, created_at, created_by, last_modified, name, override_keys, status, traffic_percentage, context, variants, last_modified_by, chosen_variant) FROM stdin;
+\.
+
+
+--
+-- Data for Name: functions; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.functions (function_name, published_code, draft_code, function_description, published_runtime_version, draft_runtime_version, published_at, draft_edited_at, published_by, draft_edited_by, last_modified_at, last_modified_by) FROM stdin;
+axios_validator_example	Ly8gVGhpcyBmdW5jdGlvbiBzaG91bGQgcmV0dXJuIGEgYm9vbGVhbiwgdHJ1ZSBmb3Igc3VjY2Vzc2Z1bCB2YWxpZGF0aW9uIGFuZCBmYWxzZSBpZiBub3QuIElmIHRoZSB2YWxpZGF0ZSBmdW5jdGlvbiByZXR1cm5zIGZhbHNlLAovLyBTdXBlcnBvc2l0aW9uIHdpbGwgbm90IGFsbG93IHRoZSBpdGVtIHRvIGJlIHNhdmVkCgphc3luYyBmdW5jdGlvbiB2YWxpZGF0ZShrZXksIHZhbHVlKSB7CiAgICByZXR1cm4gYXhpb3MuZ2V0KHZhbHVlKS50aGVuKHJlc3BvbnNlID0+IHJlc3BvbnNlLnN0YXR1cyA9PSAnMjAwJykKICAgIC5jYXRjaChlcnIgPT4gewogICAgICAgIGNvbnNvbGUubG9nKGVycik7CiAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgfSk7Cn0K	Ly8gVGhpcyBmdW5jdGlvbiBzaG91bGQgcmV0dXJuIGEgYm9vbGVhbiwgdHJ1ZSBmb3Igc3VjY2Vzc2Z1bCB2YWxpZGF0aW9uIGFuZCBmYWxzZSBpZiBub3QuIElmIHRoZSB2YWxpZGF0ZSBmdW5jdGlvbiByZXR1cm5zIGZhbHNlLAovLyBTdXBlcnBvc2l0aW9uIHdpbGwgbm90IGFsbG93IHRoZSBpdGVtIHRvIGJlIHNhdmVkCgphc3luYyBmdW5jdGlvbiB2YWxpZGF0ZShrZXksIHZhbHVlKSB7CiAgICByZXR1cm4gYXhpb3MuZ2V0KHZhbHVlKS50aGVuKHJlc3BvbnNlID0+IHJlc3BvbnNlLnN0YXR1cyA9PSAnMjAwJykKICAgIC5jYXRjaChlcnIgPT4gewogICAgICAgIGNvbnNvbGUubG9nKGVycik7CiAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgfSk7Cn0K	A function that validates URLs using axios	1.0.0	1.0.0	2024-08-22 11:02:09.420582	2024-08-22 11:02:07.801713	user@superposition.io	user@superposition.io	2024-08-22 11:02:07.801715	user@superposition.io
+\.
+
+
+--
+-- Data for Name: type_templates; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.type_templates (type_name, type_schema, created_by, created_at, last_modified_at, last_modified_by) FROM stdin;
+Number	{"type": "integer"}	user@superposition.io	2024-08-22 10:49:58.182094	2024-08-22 10:49:58.182094	null
+Decimal	{"type": "number"}	user@superposition.io	2024-08-22 10:49:58.182094	2024-08-22 10:49:58.182094	null
+Boolean	{"type": "boolean"}	user@superposition.io	2024-08-22 10:49:58.182094	2024-08-22 10:49:58.182094	null
+Enum	{"type": "string", "enum": ["android", "ios"]}	user@superposition.io	2024-08-22 10:49:58.182094	2024-08-22 10:49:58.182094	null
+Pattern	{"type": "string", "pattern": ".*"}	user@superposition.io	2024-08-22 10:49:58.182094	2024-08-22 10:49:58.182094	null
+URL	{"pattern":"https://.*","type":"string"}	user@superposition.io	2024-08-22 10:51:20.428375	2024-08-22 10:51:20.428375	user@superposition.io
+\.
+
+
+--
+-- Data for Name: config_versions; Type: TABLE DATA; Schema: test_cac; Owner: postgres
+--
+
+COPY test_cac.config_versions (id, config, config_hash, tags, created_at) FROM stdin;
 \.
 
 
@@ -4553,7 +6130,7 @@ COPY dev_experimentation.experiments (id, created_at, created_by, last_modified,
 -- Data for Name: contexts; Type: TABLE DATA; Schema: test_cac; Owner: postgres
 --
 
-COPY test_cac.contexts (id, value, override_id, created_at, created_by, priority, override) FROM stdin;
+COPY test_cac.contexts (id, value, override_id, created_at, created_by, priority, override, last_modified_at, last_modified_by) FROM stdin;
 \.
 
 
@@ -4561,7 +6138,7 @@ COPY test_cac.contexts (id, value, override_id, created_at, created_by, priority
 -- Data for Name: default_configs; Type: TABLE DATA; Schema: test_cac; Owner: postgres
 --
 
-COPY test_cac.default_configs (key, value, created_at, created_by, schema, function_name) FROM stdin;
+COPY test_cac.default_configs (key, value, created_at, created_by, schema, function_name, last_modified_at, last_modified_by) FROM stdin;
 \.
 
 
@@ -4569,8 +6146,8 @@ COPY test_cac.default_configs (key, value, created_at, created_by, schema, funct
 -- Data for Name: dimensions; Type: TABLE DATA; Schema: test_cac; Owner: postgres
 --
 
-COPY test_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name) FROM stdin;
-variantIds	1	2024-05-01 11:25:36.713795+00	anon@juspay.in	{"type": "string","pattern": ".*"}	\N
+COPY test_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name, last_modified_at, last_modified_by) FROM stdin;
+variantIds	1	2024-08-22 12:05:39.024602+00	user@example.com	{"type": "string","pattern": ".*"}	\N	2024-08-22 12:05:39.024602	null
 \.
 
 
@@ -4651,7 +6228,6 @@ COPY test_cac.event_log_y2024m04 (id, table_name, user_name, "timestamp", action
 --
 
 COPY test_cac.event_log_y2024m05 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
-2ab8a93a-8329-4af2-823b-908d1e3fbd50	dimensions	postgres	2024-05-01 11:25:36.713795	INSERT	\N	{"dimension":"variantIds","priority":1,"created_at":"2024-05-01T11:25:36.713795+00:00","created_by":"anon@juspay.in","schema":{"type": "string","pattern": ".*"},"function_name":null}	INSERT INTO test_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name) VALUES ('variantIds', 1, CURRENT_TIMESTAMP, 'anon@juspay.in', '{"type": "string","pattern": ".*"}'::json, null);
 \.
 
 
@@ -4676,6 +6252,7 @@ COPY test_cac.event_log_y2024m07 (id, table_name, user_name, "timestamp", action
 --
 
 COPY test_cac.event_log_y2024m08 (id, table_name, user_name, "timestamp", action, original_data, new_data, query) FROM stdin;
+4bc2e2ba-e52f-444c-ac89-40d5f5461901	dimensions	postgres	2024-08-22 12:05:39.024602	INSERT	\N	{"dimension":"variantIds","priority":1,"created_at":"2024-08-22T12:05:39.024602+00:00","created_by":"user@example.com","schema":{"type": "string","pattern": ".*"},"function_name":null,"last_modified_at":"2024-08-22T12:05:39.024602","last_modified_by":"null"}	INSERT INTO test_cac.dimensions (dimension, priority, created_at, created_by, schema, function_name) VALUES ('variantIds', 1, CURRENT_TIMESTAMP, 'user@example.com', '{"type": "string","pattern": ".*"}'::json, null);
 \.
 
 
@@ -4907,7 +6484,20 @@ COPY test_cac.event_log_y2026m12 (id, table_name, user_name, "timestamp", action
 -- Data for Name: functions; Type: TABLE DATA; Schema: test_cac; Owner: postgres
 --
 
-COPY test_cac.functions (function_name, published_code, draft_code, function_description, published_runtime_version, draft_runtime_version, published_at, draft_edited_at, published_by, draft_edited_by) FROM stdin;
+COPY test_cac.functions (function_name, published_code, draft_code, function_description, published_runtime_version, draft_runtime_version, published_at, draft_edited_at, published_by, draft_edited_by, last_modified_at, last_modified_by) FROM stdin;
+\.
+
+
+--
+-- Data for Name: type_templates; Type: TABLE DATA; Schema: test_cac; Owner: postgres
+--
+
+COPY test_cac.type_templates (type_name, type_schema, created_by, created_at, last_modified_at, last_modified_by) FROM stdin;
+Number	{"type": "integer"}	user@superposition.io	2024-08-22 12:05:38.712154	2024-08-22 12:05:38.712154	null
+Decimal	{"type": "number"}	user@superposition.io	2024-08-22 12:05:38.712154	2024-08-22 12:05:38.712154	null
+Boolean	{"type": "boolean"}	user@superposition.io	2024-08-22 12:05:38.712154	2024-08-22 12:05:38.712154	null
+Enum	{"type": "string", "enum": ["android", "ios"]}	user@superposition.io	2024-08-22 12:05:38.712154	2024-08-22 12:05:38.712154	null
+Pattern	{"type": "string", "pattern": ".*"}	user@superposition.io	2024-08-22 12:05:38.712154	2024-08-22 12:05:38.712154	null
 \.
 
 
@@ -5245,6 +6835,14 @@ COPY test_experimentation.event_log_y2026m12 (id, table_name, user_name, "timest
 
 COPY test_experimentation.experiments (id, created_at, created_by, last_modified, name, override_keys, status, traffic_percentage, context, variants, last_modified_by, chosen_variant) FROM stdin;
 \.
+
+
+--
+-- Name: config_versions config_versions_pkey; Type: CONSTRAINT; Schema: dev_cac; Owner: postgres
+--
+
+ALTER TABLE ONLY dev_cac.config_versions
+    ADD CONSTRAINT config_versions_pkey PRIMARY KEY (id);
 
 
 --
@@ -5616,6 +7214,14 @@ ALTER TABLE ONLY dev_cac.functions
 
 
 --
+-- Name: type_templates type_templates_pkey; Type: CONSTRAINT; Schema: dev_cac; Owner: postgres
+--
+
+ALTER TABLE ONLY dev_cac.type_templates
+    ADD CONSTRAINT type_templates_pkey PRIMARY KEY (type_name);
+
+
+--
 -- Name: event_log event_log_pkey; Type: CONSTRAINT; Schema: dev_experimentation; Owner: postgres
 --
 
@@ -5957,6 +7563,414 @@ ALTER TABLE ONLY dev_experimentation.event_log_y2026m12
 
 ALTER TABLE ONLY dev_experimentation.experiments
     ADD CONSTRAINT experiments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: __diesel_schema_migrations __diesel_schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.__diesel_schema_migrations
+    ADD CONSTRAINT __diesel_schema_migrations_pkey PRIMARY KEY (version);
+
+
+--
+-- Name: config_versions config_versions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.config_versions
+    ADD CONSTRAINT config_versions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: contexts contexts_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.contexts
+    ADD CONSTRAINT contexts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: default_configs default_configs_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.default_configs
+    ADD CONSTRAINT default_configs_pkey PRIMARY KEY (key);
+
+
+--
+-- Name: dimensions dimensions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.dimensions
+    ADD CONSTRAINT dimensions_pkey PRIMARY KEY (dimension);
+
+
+--
+-- Name: event_log event_log_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log
+    ADD CONSTRAINT event_log_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2023m08 event_log_y2023m08_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2023m08
+    ADD CONSTRAINT event_log_y2023m08_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2023m09 event_log_y2023m09_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2023m09
+    ADD CONSTRAINT event_log_y2023m09_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2023m10 event_log_y2023m10_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2023m10
+    ADD CONSTRAINT event_log_y2023m10_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2023m11 event_log_y2023m11_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2023m11
+    ADD CONSTRAINT event_log_y2023m11_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2023m12 event_log_y2023m12_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2023m12
+    ADD CONSTRAINT event_log_y2023m12_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m01 event_log_y2024m01_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m01
+    ADD CONSTRAINT event_log_y2024m01_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m02 event_log_y2024m02_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m02
+    ADD CONSTRAINT event_log_y2024m02_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m03 event_log_y2024m03_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m03
+    ADD CONSTRAINT event_log_y2024m03_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m04 event_log_y2024m04_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m04
+    ADD CONSTRAINT event_log_y2024m04_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m05 event_log_y2024m05_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m05
+    ADD CONSTRAINT event_log_y2024m05_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m06 event_log_y2024m06_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m06
+    ADD CONSTRAINT event_log_y2024m06_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m07 event_log_y2024m07_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m07
+    ADD CONSTRAINT event_log_y2024m07_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m08 event_log_y2024m08_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m08
+    ADD CONSTRAINT event_log_y2024m08_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m09 event_log_y2024m09_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m09
+    ADD CONSTRAINT event_log_y2024m09_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m10 event_log_y2024m10_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m10
+    ADD CONSTRAINT event_log_y2024m10_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m11 event_log_y2024m11_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m11
+    ADD CONSTRAINT event_log_y2024m11_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2024m12 event_log_y2024m12_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2024m12
+    ADD CONSTRAINT event_log_y2024m12_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m01 event_log_y2025m01_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m01
+    ADD CONSTRAINT event_log_y2025m01_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m02 event_log_y2025m02_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m02
+    ADD CONSTRAINT event_log_y2025m02_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m03 event_log_y2025m03_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m03
+    ADD CONSTRAINT event_log_y2025m03_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m04 event_log_y2025m04_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m04
+    ADD CONSTRAINT event_log_y2025m04_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m05 event_log_y2025m05_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m05
+    ADD CONSTRAINT event_log_y2025m05_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m06 event_log_y2025m06_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m06
+    ADD CONSTRAINT event_log_y2025m06_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m07 event_log_y2025m07_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m07
+    ADD CONSTRAINT event_log_y2025m07_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m08 event_log_y2025m08_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m08
+    ADD CONSTRAINT event_log_y2025m08_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m09 event_log_y2025m09_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m09
+    ADD CONSTRAINT event_log_y2025m09_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m10 event_log_y2025m10_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m10
+    ADD CONSTRAINT event_log_y2025m10_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m11 event_log_y2025m11_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m11
+    ADD CONSTRAINT event_log_y2025m11_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2025m12 event_log_y2025m12_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2025m12
+    ADD CONSTRAINT event_log_y2025m12_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m01 event_log_y2026m01_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m01
+    ADD CONSTRAINT event_log_y2026m01_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m02 event_log_y2026m02_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m02
+    ADD CONSTRAINT event_log_y2026m02_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m03 event_log_y2026m03_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m03
+    ADD CONSTRAINT event_log_y2026m03_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m04 event_log_y2026m04_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m04
+    ADD CONSTRAINT event_log_y2026m04_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m05 event_log_y2026m05_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m05
+    ADD CONSTRAINT event_log_y2026m05_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m06 event_log_y2026m06_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m06
+    ADD CONSTRAINT event_log_y2026m06_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m07 event_log_y2026m07_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m07
+    ADD CONSTRAINT event_log_y2026m07_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m08 event_log_y2026m08_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m08
+    ADD CONSTRAINT event_log_y2026m08_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m09 event_log_y2026m09_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m09
+    ADD CONSTRAINT event_log_y2026m09_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m10 event_log_y2026m10_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m10
+    ADD CONSTRAINT event_log_y2026m10_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m11 event_log_y2026m11_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m11
+    ADD CONSTRAINT event_log_y2026m11_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: event_log_y2026m12 event_log_y2026m12_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.event_log_y2026m12
+    ADD CONSTRAINT event_log_y2026m12_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: experiments experiments_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.experiments
+    ADD CONSTRAINT experiments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: functions functions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.functions
+    ADD CONSTRAINT functions_pkey PRIMARY KEY (function_name);
+
+
+--
+-- Name: type_templates type_templates_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.type_templates
+    ADD CONSTRAINT type_templates_pkey PRIMARY KEY (type_name);
+
+
+--
+-- Name: config_versions config_versions_pkey; Type: CONSTRAINT; Schema: test_cac; Owner: postgres
+--
+
+ALTER TABLE ONLY test_cac.config_versions
+    ADD CONSTRAINT config_versions_pkey PRIMARY KEY (id);
 
 
 --
@@ -6328,6 +8342,14 @@ ALTER TABLE ONLY test_cac.functions
 
 
 --
+-- Name: type_templates type_templates_pkey; Type: CONSTRAINT; Schema: test_cac; Owner: postgres
+--
+
+ALTER TABLE ONLY test_cac.type_templates
+    ADD CONSTRAINT type_templates_pkey PRIMARY KEY (type_name);
+
+
+--
 -- Name: event_log event_log_pkey; Type: CONSTRAINT; Schema: test_experimentation; Owner: postgres
 --
 
@@ -6669,6 +8691,20 @@ ALTER TABLE ONLY test_experimentation.event_log_y2026m12
 
 ALTER TABLE ONLY test_experimentation.experiments
     ADD CONSTRAINT experiments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: config_verions_tags_index; Type: INDEX; Schema: dev_cac; Owner: postgres
+--
+
+CREATE INDEX config_verions_tags_index ON dev_cac.config_versions USING gin (tags);
+
+
+--
+-- Name: config_versions_id_index; Type: INDEX; Schema: dev_cac; Owner: postgres
+--
+
+CREATE INDEX config_versions_id_index ON dev_cac.config_versions USING btree (id);
 
 
 --
@@ -7551,6 +9587,27 @@ CREATE INDEX event_log_y2026m12_table_name_action_timestamp_idx ON dev_cac.event
 --
 
 CREATE INDEX event_log_y2026m12_timestamp_action_table_name_idx ON dev_cac.event_log_y2026m12 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: type_templates_created_at_index; Type: INDEX; Schema: dev_cac; Owner: postgres
+--
+
+CREATE INDEX type_templates_created_at_index ON dev_cac.type_templates USING btree (created_at);
+
+
+--
+-- Name: type_templates_index; Type: INDEX; Schema: dev_cac; Owner: postgres
+--
+
+CREATE INDEX type_templates_index ON dev_cac.type_templates USING btree (type_name);
+
+
+--
+-- Name: type_templates_last_modifed_index; Type: INDEX; Schema: dev_cac; Owner: postgres
+--
+
+CREATE INDEX type_templates_last_modifed_index ON dev_cac.type_templates USING btree (last_modified_at);
 
 
 --
@@ -8457,6 +10514,958 @@ CREATE INDEX experiment_status_index ON dev_experimentation.experiments USING bt
 
 
 --
+-- Name: config_verions_tags_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX config_verions_tags_index ON public.config_versions USING gin (tags);
+
+
+--
+-- Name: config_versions_id_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX config_versions_id_index ON public.config_versions USING btree (id);
+
+
+--
+-- Name: event_log_action_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_action_index ON ONLY public.event_log USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_table_name_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_table_name_index ON ONLY public.event_log USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_timestamp_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_timestamp_index ON ONLY public.event_log USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2023m08_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m08_action_timestamp_table_name_idx ON public.event_log_y2023m08 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2023m08_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m08_table_name_action_timestamp_idx ON public.event_log_y2023m08 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2023m08_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m08_timestamp_action_table_name_idx ON public.event_log_y2023m08 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2023m09_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m09_action_timestamp_table_name_idx ON public.event_log_y2023m09 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2023m09_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m09_table_name_action_timestamp_idx ON public.event_log_y2023m09 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2023m09_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m09_timestamp_action_table_name_idx ON public.event_log_y2023m09 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2023m10_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m10_action_timestamp_table_name_idx ON public.event_log_y2023m10 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2023m10_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m10_table_name_action_timestamp_idx ON public.event_log_y2023m10 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2023m10_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m10_timestamp_action_table_name_idx ON public.event_log_y2023m10 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2023m11_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m11_action_timestamp_table_name_idx ON public.event_log_y2023m11 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2023m11_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m11_table_name_action_timestamp_idx ON public.event_log_y2023m11 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2023m11_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m11_timestamp_action_table_name_idx ON public.event_log_y2023m11 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2023m12_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m12_action_timestamp_table_name_idx ON public.event_log_y2023m12 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2023m12_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m12_table_name_action_timestamp_idx ON public.event_log_y2023m12 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2023m12_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2023m12_timestamp_action_table_name_idx ON public.event_log_y2023m12 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m01_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m01_action_timestamp_table_name_idx ON public.event_log_y2024m01 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m01_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m01_table_name_action_timestamp_idx ON public.event_log_y2024m01 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m01_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m01_timestamp_action_table_name_idx ON public.event_log_y2024m01 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m02_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m02_action_timestamp_table_name_idx ON public.event_log_y2024m02 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m02_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m02_table_name_action_timestamp_idx ON public.event_log_y2024m02 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m02_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m02_timestamp_action_table_name_idx ON public.event_log_y2024m02 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m03_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m03_action_timestamp_table_name_idx ON public.event_log_y2024m03 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m03_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m03_table_name_action_timestamp_idx ON public.event_log_y2024m03 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m03_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m03_timestamp_action_table_name_idx ON public.event_log_y2024m03 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m04_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m04_action_timestamp_table_name_idx ON public.event_log_y2024m04 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m04_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m04_table_name_action_timestamp_idx ON public.event_log_y2024m04 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m04_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m04_timestamp_action_table_name_idx ON public.event_log_y2024m04 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m05_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m05_action_timestamp_table_name_idx ON public.event_log_y2024m05 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m05_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m05_table_name_action_timestamp_idx ON public.event_log_y2024m05 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m05_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m05_timestamp_action_table_name_idx ON public.event_log_y2024m05 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m06_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m06_action_timestamp_table_name_idx ON public.event_log_y2024m06 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m06_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m06_table_name_action_timestamp_idx ON public.event_log_y2024m06 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m06_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m06_timestamp_action_table_name_idx ON public.event_log_y2024m06 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m07_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m07_action_timestamp_table_name_idx ON public.event_log_y2024m07 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m07_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m07_table_name_action_timestamp_idx ON public.event_log_y2024m07 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m07_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m07_timestamp_action_table_name_idx ON public.event_log_y2024m07 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m08_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m08_action_timestamp_table_name_idx ON public.event_log_y2024m08 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m08_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m08_table_name_action_timestamp_idx ON public.event_log_y2024m08 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m08_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m08_timestamp_action_table_name_idx ON public.event_log_y2024m08 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m09_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m09_action_timestamp_table_name_idx ON public.event_log_y2024m09 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m09_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m09_table_name_action_timestamp_idx ON public.event_log_y2024m09 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m09_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m09_timestamp_action_table_name_idx ON public.event_log_y2024m09 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m10_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m10_action_timestamp_table_name_idx ON public.event_log_y2024m10 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m10_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m10_table_name_action_timestamp_idx ON public.event_log_y2024m10 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m10_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m10_timestamp_action_table_name_idx ON public.event_log_y2024m10 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m11_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m11_action_timestamp_table_name_idx ON public.event_log_y2024m11 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m11_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m11_table_name_action_timestamp_idx ON public.event_log_y2024m11 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m11_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m11_timestamp_action_table_name_idx ON public.event_log_y2024m11 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2024m12_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m12_action_timestamp_table_name_idx ON public.event_log_y2024m12 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2024m12_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m12_table_name_action_timestamp_idx ON public.event_log_y2024m12 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2024m12_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2024m12_timestamp_action_table_name_idx ON public.event_log_y2024m12 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m01_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m01_action_timestamp_table_name_idx ON public.event_log_y2025m01 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m01_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m01_table_name_action_timestamp_idx ON public.event_log_y2025m01 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m01_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m01_timestamp_action_table_name_idx ON public.event_log_y2025m01 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m02_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m02_action_timestamp_table_name_idx ON public.event_log_y2025m02 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m02_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m02_table_name_action_timestamp_idx ON public.event_log_y2025m02 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m02_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m02_timestamp_action_table_name_idx ON public.event_log_y2025m02 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m03_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m03_action_timestamp_table_name_idx ON public.event_log_y2025m03 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m03_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m03_table_name_action_timestamp_idx ON public.event_log_y2025m03 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m03_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m03_timestamp_action_table_name_idx ON public.event_log_y2025m03 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m04_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m04_action_timestamp_table_name_idx ON public.event_log_y2025m04 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m04_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m04_table_name_action_timestamp_idx ON public.event_log_y2025m04 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m04_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m04_timestamp_action_table_name_idx ON public.event_log_y2025m04 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m05_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m05_action_timestamp_table_name_idx ON public.event_log_y2025m05 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m05_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m05_table_name_action_timestamp_idx ON public.event_log_y2025m05 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m05_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m05_timestamp_action_table_name_idx ON public.event_log_y2025m05 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m06_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m06_action_timestamp_table_name_idx ON public.event_log_y2025m06 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m06_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m06_table_name_action_timestamp_idx ON public.event_log_y2025m06 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m06_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m06_timestamp_action_table_name_idx ON public.event_log_y2025m06 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m07_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m07_action_timestamp_table_name_idx ON public.event_log_y2025m07 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m07_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m07_table_name_action_timestamp_idx ON public.event_log_y2025m07 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m07_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m07_timestamp_action_table_name_idx ON public.event_log_y2025m07 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m08_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m08_action_timestamp_table_name_idx ON public.event_log_y2025m08 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m08_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m08_table_name_action_timestamp_idx ON public.event_log_y2025m08 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m08_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m08_timestamp_action_table_name_idx ON public.event_log_y2025m08 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m09_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m09_action_timestamp_table_name_idx ON public.event_log_y2025m09 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m09_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m09_table_name_action_timestamp_idx ON public.event_log_y2025m09 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m09_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m09_timestamp_action_table_name_idx ON public.event_log_y2025m09 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m10_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m10_action_timestamp_table_name_idx ON public.event_log_y2025m10 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m10_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m10_table_name_action_timestamp_idx ON public.event_log_y2025m10 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m10_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m10_timestamp_action_table_name_idx ON public.event_log_y2025m10 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m11_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m11_action_timestamp_table_name_idx ON public.event_log_y2025m11 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m11_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m11_table_name_action_timestamp_idx ON public.event_log_y2025m11 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m11_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m11_timestamp_action_table_name_idx ON public.event_log_y2025m11 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2025m12_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m12_action_timestamp_table_name_idx ON public.event_log_y2025m12 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2025m12_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m12_table_name_action_timestamp_idx ON public.event_log_y2025m12 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2025m12_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2025m12_timestamp_action_table_name_idx ON public.event_log_y2025m12 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m01_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m01_action_timestamp_table_name_idx ON public.event_log_y2026m01 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m01_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m01_table_name_action_timestamp_idx ON public.event_log_y2026m01 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m01_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m01_timestamp_action_table_name_idx ON public.event_log_y2026m01 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m02_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m02_action_timestamp_table_name_idx ON public.event_log_y2026m02 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m02_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m02_table_name_action_timestamp_idx ON public.event_log_y2026m02 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m02_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m02_timestamp_action_table_name_idx ON public.event_log_y2026m02 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m03_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m03_action_timestamp_table_name_idx ON public.event_log_y2026m03 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m03_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m03_table_name_action_timestamp_idx ON public.event_log_y2026m03 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m03_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m03_timestamp_action_table_name_idx ON public.event_log_y2026m03 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m04_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m04_action_timestamp_table_name_idx ON public.event_log_y2026m04 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m04_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m04_table_name_action_timestamp_idx ON public.event_log_y2026m04 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m04_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m04_timestamp_action_table_name_idx ON public.event_log_y2026m04 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m05_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m05_action_timestamp_table_name_idx ON public.event_log_y2026m05 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m05_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m05_table_name_action_timestamp_idx ON public.event_log_y2026m05 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m05_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m05_timestamp_action_table_name_idx ON public.event_log_y2026m05 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m06_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m06_action_timestamp_table_name_idx ON public.event_log_y2026m06 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m06_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m06_table_name_action_timestamp_idx ON public.event_log_y2026m06 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m06_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m06_timestamp_action_table_name_idx ON public.event_log_y2026m06 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m07_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m07_action_timestamp_table_name_idx ON public.event_log_y2026m07 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m07_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m07_table_name_action_timestamp_idx ON public.event_log_y2026m07 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m07_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m07_timestamp_action_table_name_idx ON public.event_log_y2026m07 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m08_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m08_action_timestamp_table_name_idx ON public.event_log_y2026m08 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m08_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m08_table_name_action_timestamp_idx ON public.event_log_y2026m08 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m08_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m08_timestamp_action_table_name_idx ON public.event_log_y2026m08 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m09_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m09_action_timestamp_table_name_idx ON public.event_log_y2026m09 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m09_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m09_table_name_action_timestamp_idx ON public.event_log_y2026m09 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m09_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m09_timestamp_action_table_name_idx ON public.event_log_y2026m09 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m10_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m10_action_timestamp_table_name_idx ON public.event_log_y2026m10 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m10_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m10_table_name_action_timestamp_idx ON public.event_log_y2026m10 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m10_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m10_timestamp_action_table_name_idx ON public.event_log_y2026m10 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m11_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m11_action_timestamp_table_name_idx ON public.event_log_y2026m11 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m11_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m11_table_name_action_timestamp_idx ON public.event_log_y2026m11 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m11_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m11_timestamp_action_table_name_idx ON public.event_log_y2026m11 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: event_log_y2026m12_action_timestamp_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m12_action_timestamp_table_name_idx ON public.event_log_y2026m12 USING btree (action) INCLUDE ("timestamp", table_name);
+
+
+--
+-- Name: event_log_y2026m12_table_name_action_timestamp_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m12_table_name_action_timestamp_idx ON public.event_log_y2026m12 USING btree (table_name) INCLUDE (action, "timestamp");
+
+
+--
+-- Name: event_log_y2026m12_timestamp_action_table_name_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX event_log_y2026m12_timestamp_action_table_name_idx ON public.event_log_y2026m12 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: experiment_created_date_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX experiment_created_date_index ON public.experiments USING btree (created_at) INCLUDE (id);
+
+
+--
+-- Name: experiment_last_modified_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX experiment_last_modified_index ON public.experiments USING btree (last_modified) INCLUDE (id, created_at);
+
+
+--
+-- Name: experiment_status_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX experiment_status_index ON public.experiments USING btree (status) INCLUDE (created_at, last_modified);
+
+
+--
+-- Name: type_templates_created_at_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX type_templates_created_at_index ON public.type_templates USING btree (created_at);
+
+
+--
+-- Name: type_templates_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX type_templates_index ON public.type_templates USING btree (type_name);
+
+
+--
+-- Name: type_templates_last_modifed_index; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX type_templates_last_modifed_index ON public.type_templates USING btree (last_modified_at);
+
+
+--
+-- Name: config_verions_tags_index; Type: INDEX; Schema: test_cac; Owner: postgres
+--
+
+CREATE INDEX config_verions_tags_index ON test_cac.config_versions USING gin (tags);
+
+
+--
+-- Name: config_versions_id_index; Type: INDEX; Schema: test_cac; Owner: postgres
+--
+
+CREATE INDEX config_versions_id_index ON test_cac.config_versions USING btree (id);
+
+
+--
 -- Name: event_log_action_index; Type: INDEX; Schema: test_cac; Owner: postgres
 --
 
@@ -9336,6 +12345,27 @@ CREATE INDEX event_log_y2026m12_table_name_action_timestamp_idx ON test_cac.even
 --
 
 CREATE INDEX event_log_y2026m12_timestamp_action_table_name_idx ON test_cac.event_log_y2026m12 USING btree ("timestamp") INCLUDE (action, table_name);
+
+
+--
+-- Name: type_templates_created_at_index; Type: INDEX; Schema: test_cac; Owner: postgres
+--
+
+CREATE INDEX type_templates_created_at_index ON test_cac.type_templates USING btree (created_at);
+
+
+--
+-- Name: type_templates_index; Type: INDEX; Schema: test_cac; Owner: postgres
+--
+
+CREATE INDEX type_templates_index ON test_cac.type_templates USING btree (type_name);
+
+
+--
+-- Name: type_templates_last_modifed_index; Type: INDEX; Schema: test_cac; Owner: postgres
+--
+
+CREATE INDEX type_templates_last_modifed_index ON test_cac.type_templates USING btree (last_modified_at);
 
 
 --
@@ -12538,6 +15568,1154 @@ ALTER INDEX dev_experimentation.event_log_timestamp_index ATTACH PARTITION dev_e
 
 
 --
+-- Name: event_log_y2023m08_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2023m08_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m08_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2023m08_pkey;
+
+
+--
+-- Name: event_log_y2023m08_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2023m08_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2023m08_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2023m08_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m09_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2023m09_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m09_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2023m09_pkey;
+
+
+--
+-- Name: event_log_y2023m09_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2023m09_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2023m09_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2023m09_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m10_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2023m10_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m10_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2023m10_pkey;
+
+
+--
+-- Name: event_log_y2023m10_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2023m10_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2023m10_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2023m10_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m11_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2023m11_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m11_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2023m11_pkey;
+
+
+--
+-- Name: event_log_y2023m11_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2023m11_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2023m11_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2023m11_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m12_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2023m12_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2023m12_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2023m12_pkey;
+
+
+--
+-- Name: event_log_y2023m12_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2023m12_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2023m12_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2023m12_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m01_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m01_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m01_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m01_pkey;
+
+
+--
+-- Name: event_log_y2024m01_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m01_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m01_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m01_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m02_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m02_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m02_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m02_pkey;
+
+
+--
+-- Name: event_log_y2024m02_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m02_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m02_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m02_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m03_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m03_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m03_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m03_pkey;
+
+
+--
+-- Name: event_log_y2024m03_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m03_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m03_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m03_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m04_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m04_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m04_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m04_pkey;
+
+
+--
+-- Name: event_log_y2024m04_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m04_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m04_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m04_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m05_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m05_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m05_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m05_pkey;
+
+
+--
+-- Name: event_log_y2024m05_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m05_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m05_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m05_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m06_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m06_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m06_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m06_pkey;
+
+
+--
+-- Name: event_log_y2024m06_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m06_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m06_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m06_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m07_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m07_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m07_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m07_pkey;
+
+
+--
+-- Name: event_log_y2024m07_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m07_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m07_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m07_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m08_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m08_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m08_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m08_pkey;
+
+
+--
+-- Name: event_log_y2024m08_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m08_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m08_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m08_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m09_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m09_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m09_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m09_pkey;
+
+
+--
+-- Name: event_log_y2024m09_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m09_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m09_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m09_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m10_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m10_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m10_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m10_pkey;
+
+
+--
+-- Name: event_log_y2024m10_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m10_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m10_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m10_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m11_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m11_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m11_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m11_pkey;
+
+
+--
+-- Name: event_log_y2024m11_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m11_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m11_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m11_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m12_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2024m12_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2024m12_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2024m12_pkey;
+
+
+--
+-- Name: event_log_y2024m12_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2024m12_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2024m12_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2024m12_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m01_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m01_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m01_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m01_pkey;
+
+
+--
+-- Name: event_log_y2025m01_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m01_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m01_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m01_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m02_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m02_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m02_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m02_pkey;
+
+
+--
+-- Name: event_log_y2025m02_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m02_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m02_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m02_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m03_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m03_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m03_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m03_pkey;
+
+
+--
+-- Name: event_log_y2025m03_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m03_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m03_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m03_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m04_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m04_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m04_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m04_pkey;
+
+
+--
+-- Name: event_log_y2025m04_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m04_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m04_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m04_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m05_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m05_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m05_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m05_pkey;
+
+
+--
+-- Name: event_log_y2025m05_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m05_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m05_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m05_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m06_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m06_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m06_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m06_pkey;
+
+
+--
+-- Name: event_log_y2025m06_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m06_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m06_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m06_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m07_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m07_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m07_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m07_pkey;
+
+
+--
+-- Name: event_log_y2025m07_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m07_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m07_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m07_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m08_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m08_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m08_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m08_pkey;
+
+
+--
+-- Name: event_log_y2025m08_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m08_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m08_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m08_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m09_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m09_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m09_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m09_pkey;
+
+
+--
+-- Name: event_log_y2025m09_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m09_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m09_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m09_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m10_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m10_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m10_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m10_pkey;
+
+
+--
+-- Name: event_log_y2025m10_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m10_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m10_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m10_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m11_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m11_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m11_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m11_pkey;
+
+
+--
+-- Name: event_log_y2025m11_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m11_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m11_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m11_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m12_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2025m12_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2025m12_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2025m12_pkey;
+
+
+--
+-- Name: event_log_y2025m12_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2025m12_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2025m12_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2025m12_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m01_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m01_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m01_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m01_pkey;
+
+
+--
+-- Name: event_log_y2026m01_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m01_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m01_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m01_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m02_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m02_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m02_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m02_pkey;
+
+
+--
+-- Name: event_log_y2026m02_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m02_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m02_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m02_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m03_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m03_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m03_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m03_pkey;
+
+
+--
+-- Name: event_log_y2026m03_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m03_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m03_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m03_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m04_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m04_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m04_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m04_pkey;
+
+
+--
+-- Name: event_log_y2026m04_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m04_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m04_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m04_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m05_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m05_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m05_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m05_pkey;
+
+
+--
+-- Name: event_log_y2026m05_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m05_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m05_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m05_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m06_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m06_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m06_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m06_pkey;
+
+
+--
+-- Name: event_log_y2026m06_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m06_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m06_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m06_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m07_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m07_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m07_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m07_pkey;
+
+
+--
+-- Name: event_log_y2026m07_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m07_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m07_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m07_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m08_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m08_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m08_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m08_pkey;
+
+
+--
+-- Name: event_log_y2026m08_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m08_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m08_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m08_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m09_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m09_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m09_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m09_pkey;
+
+
+--
+-- Name: event_log_y2026m09_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m09_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m09_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m09_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m10_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m10_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m10_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m10_pkey;
+
+
+--
+-- Name: event_log_y2026m10_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m10_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m10_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m10_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m11_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m11_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m11_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m11_pkey;
+
+
+--
+-- Name: event_log_y2026m11_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m11_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m11_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m11_timestamp_action_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m12_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_action_index ATTACH PARTITION public.event_log_y2026m12_action_timestamp_table_name_idx;
+
+
+--
+-- Name: event_log_y2026m12_pkey; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_pkey ATTACH PARTITION public.event_log_y2026m12_pkey;
+
+
+--
+-- Name: event_log_y2026m12_table_name_action_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_table_name_index ATTACH PARTITION public.event_log_y2026m12_table_name_action_timestamp_idx;
+
+
+--
+-- Name: event_log_y2026m12_timestamp_action_table_name_idx; Type: INDEX ATTACH; Schema: public; Owner: postgres
+--
+
+ALTER INDEX public.event_log_timestamp_index ATTACH PARTITION public.event_log_y2026m12_timestamp_action_table_name_idx;
+
+
+--
 -- Name: event_log_y2023m08_action_timestamp_table_name_idx; Type: INDEX ATTACH; Schema: test_cac; Owner: postgres
 --
 
@@ -14869,6 +19047,41 @@ CREATE TRIGGER experiments_audit AFTER INSERT OR DELETE OR UPDATE ON dev_experim
 
 
 --
+-- Name: contexts contexts_audit; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER contexts_audit AFTER INSERT OR DELETE OR UPDATE ON public.contexts FOR EACH ROW EXECUTE FUNCTION public.event_logger();
+
+
+--
+-- Name: default_configs default_configs_audit; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER default_configs_audit AFTER INSERT OR DELETE OR UPDATE ON public.default_configs FOR EACH ROW EXECUTE FUNCTION public.event_logger();
+
+
+--
+-- Name: dimensions dimensions_audit; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER dimensions_audit AFTER INSERT OR DELETE OR UPDATE ON public.dimensions FOR EACH ROW EXECUTE FUNCTION public.event_logger();
+
+
+--
+-- Name: experiments experiments_audit; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER experiments_audit AFTER INSERT OR DELETE OR UPDATE ON public.experiments FOR EACH ROW EXECUTE FUNCTION public.event_logger();
+
+
+--
+-- Name: functions functions_audit; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER functions_audit AFTER INSERT OR DELETE OR UPDATE ON public.functions FOR EACH ROW EXECUTE FUNCTION public.event_logger();
+
+
+--
 -- Name: contexts contexts_audit; Type: TRIGGER; Schema: test_cac; Owner: postgres
 --
 
@@ -14920,6 +19133,22 @@ ALTER TABLE ONLY dev_cac.dimensions
 
 
 --
+-- Name: default_configs default_configs_function_name_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.default_configs
+    ADD CONSTRAINT default_configs_function_name_fkey FOREIGN KEY (function_name) REFERENCES public.functions(function_name);
+
+
+--
+-- Name: dimensions dimensions_function_name_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.dimensions
+    ADD CONSTRAINT dimensions_function_name_fkey FOREIGN KEY (function_name) REFERENCES public.functions(function_name);
+
+
+--
 -- Name: default_configs default_configs_function_name_fkey; Type: FK CONSTRAINT; Schema: test_cac; Owner: postgres
 --
 
@@ -14934,113 +19163,6 @@ ALTER TABLE ONLY test_cac.default_configs
 ALTER TABLE ONLY test_cac.dimensions
     ADD CONSTRAINT dimensions_function_name_fkey FOREIGN KEY (function_name) REFERENCES test_cac.functions(function_name);
 
-CREATE TABLE dev_cac.config_versions (
-    id bigint PRIMARY KEY,
-    config json NOT NULL,
-    config_hash TEXT NOT NULL,
-    tags varchar(100)[] check (array_position(tags, null) is null),
-    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS config_verions_tags_index ON dev_cac.config_versions USING gin(tags);
-CREATE INDEX IF NOT EXISTS config_versions_id_index ON dev_cac.config_versions(id);
---
--- Your SQL goes here
-CREATE TABLE dev_cac.type_templates (
-    type_name TEXT PRIMARY KEY,
-    type_schema JSON NOT NULL,
-    created_by TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
-CREATE INDEX IF NOT EXISTS type_templates_index ON dev_cac.type_templates(type_name);
-CREATE INDEX IF NOT EXISTS type_templates_created_at_index ON dev_cac.type_templates(created_at);
-CREATE INDEX IF NOT EXISTS type_templates_last_modifed_index ON dev_cac.type_templates(last_modified);
-INSERT INTO dev_cac.type_templates(type_name, type_schema, created_by, created_at)
-VALUES (
-        'Number',
-        '{"type": "integer"}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Decimal',
-        '{"type": "number"}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Boolean',
-        '{"type": "boolean"}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Enum',
-        '{"type": "string", "enum": ["android", "ios"]}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Pattern',
-        '{"type": "string", "pattern": ".*"}',
-        'user@superposition.io',
-        NOW()
-    );
-
-CREATE TABLE test_cac.config_versions (
-    id bigint PRIMARY KEY,
-    config json NOT NULL,
-    config_hash TEXT NOT NULL,
-    tags varchar(100)[] check (array_position(tags, null) is null),
-    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS config_verions_tags_index ON test_cac.config_versions USING gin(tags);
-CREATE INDEX IF NOT EXISTS config_versions_id_index ON test_cac.config_versions(id);
---
--- Your SQL goes here
-CREATE TABLE test_cac.type_templates (
-    type_name TEXT PRIMARY KEY,
-    type_schema JSON NOT NULL,
-    created_by TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
-CREATE INDEX IF NOT EXISTS type_templates_index ON test_cac.type_templates(type_name);
-CREATE INDEX IF NOT EXISTS type_templates_created_at_index ON test_cac.type_templates(created_at);
-CREATE INDEX IF NOT EXISTS type_templates_last_modifed_index ON test_cac.type_templates(last_modified);
-INSERT INTO test_cac.type_templates(type_name, type_schema, created_by, created_at)
-VALUES (
-        'Number',
-        '{"type": "integer"}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Decimal',
-        '{"type": "number"}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Boolean',
-        '{"type": "boolean"}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Enum',
-        '{"type": "string", "enum": ["android", "ios"]}',
-        'user@superposition.io',
-        NOW()
-    ),
-    (
-        'Pattern',
-        '{"type": "string", "pattern": ".*"}',
-        'user@superposition.io',
-        NOW()
-    );
 
 --
 -- PostgreSQL database dump complete
